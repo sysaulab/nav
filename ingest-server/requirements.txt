@@ -1,0 +1,27 @@
+# --- Office / PDF conversion ----------------------------------------------
+officemd>=0.0.0
+docling[opendocument]>=2.0.0
+pymupdf>=1.24.0
+
+# Possibly redundant — not imported directly by router.py or reconcile.py;
+# may be a transitive dep of docling[opendocument]. Verify before removing.
+odfdo>=0.0.0
+
+# --- PDF text-layer detection ---------------------------------------------
+# Required by _pdf_has_text_layer(); without it every PDF is treated as
+# scanned and routed to the (slower, costlier) OCR path.
+pypdf>=4.0.0
+
+# --- MIME sniffing (optional) ---------------------------------------------
+# router.py degrades gracefully to extension-based guessing if missing,
+# but false extensions will misroute files. Needs libmagic on the host:
+#   Debian/Ubuntu: apt-get install libmagic1
+#   macOS:         brew install libmagic
+python-magic>=0.4.27
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+rapidocr-onnxruntime==1.4.4
+python-multipart==0.0.9
+pillow==10.4.0
+numpy==1.26.4

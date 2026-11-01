@@ -1,0 +1,47 @@
+FROM python:3.11-slim
+
+# libpq isn't needed (SQLite), but curl is handy for healthchecks
+RUN apt-get update && apt-get install -y --no-install-recommends curl pandoc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy only packaging metadata first to leverage Docker layer caching.
+COPY pyproject.toml ./
+# Install the tokenizer extra so token estimation uses the real HF tokenizer
+# instead of the chars/3.5 heuristic. `transformers` pulls in `tokenizers`
+# (Rust) and `huggingface_hub`, but NOT torch — no CUDA, no 2GB wheel.
+RUN pip install --no-cache-dir ".[tokenizer]"
+
+COPY navigator ./navigator
+
+# Pre-download tokenizer files into the image so the first request doesn't
+# go to the network. HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE make any runtime
+# lookup that misses this cache fail fast instead of hanging on DNS.
+ENV HF_HOME=/app/.cache/huggingface \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+# Baked in as root, before USER maestro switches. chmod a+rX makes the
+# cache readable by the unprivileged user without making it writable
+# (offline mode never writes anyway).
+RUN python -c "from transformers import AutoTokenizer; \
+        AutoTokenizer.from_pretrained('google/gemma-2-2b-it')" \
+    && chmod -R a+rX /app/.cache
+
+# SQLite lives on a volume; create the dir so the non-root user can write.
+RUN useradd -m -u 1000 maestro \
+    && mkdir -p /data && chown maestro:maestro /data
+USER maestro
+
+ENV NAVIGATOR_DATABASE_URL="sqlite+aiosqlite:////data/navigator.db" \
+    NAVIGATOR_SANITIZER_ENDPOINT="http://sanitizer:8000/ingest" \
+    NAVIGATOR_NOMINATIM_ENDPOINT="http://nominatim:8080" \
+    NAVIGATOR_OLLAMA_ENDPOINT="http://ollama:11434"
+
+EXPOSE 8001
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:8001/api/health || exit 1
+
+CMD ["python", "-m", "navigator", "--host", "0.0.0.0", "--port", "8001"]

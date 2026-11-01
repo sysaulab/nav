@@ -1,0 +1,6 @@
+navigator.db
+navigator.db-shm
+navigator.db-wal
+__pycache__/
+*.pyc
+.pytest_cache/

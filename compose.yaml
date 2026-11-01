@@ -1,0 +1,67 @@
+name: navigator
+
+services:
+  # ── Document Sanitizer ───────────────────────────────────
+  sanitizer:
+    build:
+      context: ./ingest-server
+      dockerfile: dockerfile          # lowercase filename in the repo
+    image: navigator/sanitizer:local
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      SANITIZER_LOG_LEVEL: INFO
+      SANITIZER_MAX_UPLOAD_BYTES: "104857600"
+      SANITIZER_MAX_PAGES: "500"
+      SANITIZER_LOW_CONFIDENCE_THRESHOLD: "0.65"
+    restart: unless-stopped
+
+  # ── Navigator (interview orchestration) ──────────────────
+  navigator:
+    build:
+      context: ./nav-server
+      dockerfile: dockerfile
+    image: navigator/nav-server:local
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      - navigator-data:/data
+    environment:
+      NAVIGATOR_DATABASE_URL: "sqlite+aiosqlite:////data/navigator.db"
+      NAVIGATOR_SANITIZER_ENDPOINT: "http://sanitizer:8000/ingest"
+      NAVIGATOR_NOMINATIM_ENDPOINT: "http://nominatim:8080"
+
+      # ── External Ollama ──────────────────────────────────
+      # Point this at the host machine (or wherever your Ollama is
+      # listening). On Docker Desktop (macOS/Windows) the host is
+      # host.docker.internal; on Linux it's the bridge gateway
+      # (commonly 172.17.0.1).
+      NAVIGATOR_OLLAMA_ENDPOINT: "http://host.docker.internal:11434"
+
+      # gemma4:cloud and beam:cloud are Ollama Cloud tags. If your
+      # external Ollama is signed in to Ollama Cloud, these just work.
+      NAVIGATOR_OLLAMA_MODEL: "gemma4:cloud"
+      NAVIGATOR_FINAL_MODEL: "beam:cloud"
+
+    depends_on:
+      sanitizer:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Nominatim (geocoder) ─────────────────────────────────
+  nominatim:
+    image: mediagis/nominatim:4.4
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PBF_URL: "https://download.geofabrik.de/north-america/canada/quebec-latest.osm.pbf"
+      REPLICATION_URL: "https://download.geofabrik.de/north-america/canada/quebec-updates/"
+      NOMINATIM_PASSWORD: "change-me"
+    volumes:
+      - nominatim-data:/var/lib/postgresql/14/main
+    shm_size: 1gb
+    restart: unless-stopped
+
+volumes:
+  navigator-data:
+  nominatim-data:
