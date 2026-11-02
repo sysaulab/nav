@@ -1,0 +1,8 @@
+/ingest-server/app/__pycache__
+/ingest-server/app/handlers/__pycache__
+/ingest-server/app/ocr/__pycache__
+nav-server/navigator.db-shm
+nav-server/navigator.db-wal
+/web-ui/node_modules
+/web-ui/node_modules
+/web-ui/node_modules

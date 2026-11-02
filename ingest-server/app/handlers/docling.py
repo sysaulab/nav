@@ -34,7 +34,21 @@ def _map_docling_label(label: str) -> str:
 def _pages_from_docling_dict(doc_dict: dict) -> list[Page]:
     pages_map: dict[int, Page] = {}
 
-    for p in doc_dict.get("pages", []):
+    raw_pages = doc_dict.get("pages", {})
+
+    # Docling schema change: `pages` used to be a list of dicts; current
+    # export_to_dict() emits a dict keyed by page-number strings.
+    # Normalize both to an iterable of page-info dicts.
+    if isinstance(raw_pages, dict):
+        page_infos = raw_pages.values()
+    else:
+        page_infos = raw_pages
+
+    for p in page_infos:
+        if not isinstance(p, dict):
+            # Defensive: skip anything that is not a page-info object.
+            continue
+
         page_no = int(p.get("page_no", 1))
         size = p.get("size", {}) or {}
         pages_map[page_no] = Page(

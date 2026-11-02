@@ -4,18 +4,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./navigator.db"
 
-    # Sanitizer /ingest URL (configured by the operator, never exposed over HTTP).
-    ingest_server_endpoint: str = "http://127.0.0.1:8000/ingest"
-
     # Private Nominatim instance (used for address → lat/lng).
     nominatim_endpoint: str = "http://127.0.0.1:8080"
 
     session_purge_interval_s: int = 30
 
     # ── interview upload / sanitizer proxy ──────────────────
-    sanitizer_endpoint: str = "http://127.0.0.1:8000/ingest"
+    sanitizer_endpoint: str = "http://127.0.0.1:8000/ingest"   # ← canonical
     sanitizer_timeout_s: float = 600.0
     max_upload_bytes: int = 100 * 1024 * 1024
+    
 
     # ── chat backend (Ollama) ───────────────────────────────
     ollama_endpoint: str = "http://127.0.0.1:11434"

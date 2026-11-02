@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Pin by digest; renovate/dependabot can keep it current.
-FROM python:3.11.9-slim
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -27,18 +27,20 @@ COPY requirements.txt ./
 # CPU-only torch first — otherwise pip pulls the CUDA wheel (~2.5 GB)
 RUN pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cpu \
-        "torch==2.4.*" \
- && pip install --no-cache-dir -r requirements.txt\
+        "torch==2.4.1" \
+ && pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements.txt \
  && pip check
 
+
 # Warm RapidOCR + Docling model caches into a shared, app-readable path.
-# Docling warmup is optional but strongly recommended for offline-safety;
-# it adds ~500 MB and several minutes to the build.
+# NOTE: rapidocr-onnxruntime was renamed to rapidocr; onnxruntime must be
+# installed explicitly (rapidocr >=2.0.6 does not bundle it).
 RUN mkdir -p /opt/models \
- && python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR()" \
+ && python -c "from rapidocr import RapidOCR; RapidOCR()" \
  && python -c "from docling.document_converter import DocumentConverter; DocumentConverter()" \
  && chown -R app:app /opt/models
-
 COPY --chown=app:app app/ ./app/
 
 USER app

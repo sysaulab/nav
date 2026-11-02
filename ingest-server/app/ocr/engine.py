@@ -85,7 +85,7 @@ class OcrEngine:
     def _get(self) -> Any:
         if self._engine is None:
             try:
-                from rapidocr_onnxruntime import RapidOCR
+                from rapidocr import RapidOCR
             except ImportError as e:
                 raise OcrEngineError(
                     "rapidocr_onnxruntime not installed — "
@@ -103,8 +103,6 @@ class OcrEngine:
         """Run OCR on `image_bytes`. See module docstring for the contract."""
         arr = _decode(image_bytes)
         arr = _downscale(arr, _MAX_LONG_EDGE)
-        # Do NOT skip tiny images — some valid inputs (single glyphs, cropped
-        # headings) are small. Only log if surprisingly small for diagnosis.
         if max(arr.shape[:2]) < _MIN_LONG_EDGE:
             log.debug(
                 "ocr.tiny_image shape=%s — running anyway", arr.shape,
@@ -112,28 +110,27 @@ class OcrEngine:
 
         engine = self._get()
         try:
-            result, _elapse = engine(arr)
+            result = engine(arr)
         except Exception as e:
             raise OcrEngineError(f"RapidOCR inference failed: {e}") from e
 
-        # RapidOCR returns (None, None) for "no text" — including the silent
-        # single-channel case (already normalized away by _decode). Empty
-        # list and None both mean "no text"; map both to [].
-        if result is None:
+        # rapidocr 3.x returns a RapidOCROutput dataclass, not a tuple.
+        # All fields (boxes / txts / scores) are None when nothing is found.
+        if result is None or getattr(result, "txts", None) is None:
             log.debug("ocr.no_text shape=%s", arr.shape)
             return []
 
         lines: list[dict] = []
-        for raw in result:
-            # Native shape: [corner_points, text, confidence]
-            # corner_points: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+        # boxes: np.ndarray (N, 4, 2) — four corner points per line
+        # txts:  Tuple[str]
+        # scores: Tuple[float]
+        for pts, text, conf in zip(result.boxes, result.txts, result.scores):
             try:
-                pts, text, conf = raw[0], raw[1], raw[2]
                 xs = [float(p[0]) for p in pts]
                 ys = [float(p[1]) for p in pts]
             except (IndexError, TypeError, ValueError) as e:
                 log.warning(
-                    "ocr.malformed_line dropped=%r err=%s", raw, e,
+                    "ocr.malformed_line dropped=%r err=%s", (pts, text, conf), e,
                 )
                 continue
 

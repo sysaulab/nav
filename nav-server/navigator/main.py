@@ -133,22 +133,7 @@ def create_app(settings: Settings) -> FastAPI:
                 pass
             app.state.purger = None
 
-    @app.get("/api/health")
-    async def health():
-        return {
-            "status": "ok",
-            "ingest_server": settings.ingest_server_endpoint,
-            "geocoder": settings.nominatim_endpoint,
-        }
 
-    @app.get("/api/health/ingest")
-    async def health_ingest():
-        endpoint = settings.ingest_server_endpoint
-        try:
-            code, _ = await _http_get(endpoint, timeout=2.0)
-            return {"ok": True, "status_code": code, "endpoint": endpoint}
-        except Exception as e:
-            return {"ok": False, "endpoint": endpoint, "error": str(e)}
 
     @app.get("/api/health/geocoder")
     async def health_geocoder():
@@ -222,17 +207,28 @@ def create_app(settings: Settings) -> FastAPI:
             )
         return out
     
+# Remove the early duplicate entirely.
+
     @app.get("/api/health")
     async def health():
         return {
             "status": "ok",
             "service": "maestro",
             "version": app.version,
-            "ingest_server": settings.ingest_server_endpoint,
+            "sanitizer": settings.sanitizer_endpoint,
             "geocoder": settings.nominatim_endpoint,
             "ollama": settings.ollama_endpoint,
             "model": settings.ollama_model,
         }
+
+    @app.get("/api/health/ingest")
+    async def health_ingest():
+        endpoint = settings.sanitizer_endpoint
+        try:
+            code, _ = await _http_get(endpoint, timeout=5.0)   # match upload's patience
+            return {"ok": 200 <= code < 500, "status_code": code, "endpoint": endpoint}
+        except Exception as e:
+            return {"ok": False, "endpoint": endpoint, "error": str(e)}
 
     @app.get("/api/health/ollama")
     async def health_ollama():

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import * as React from 'react'
 
 /**
  * File picker + drop target. Presents as a single dashed-border zone;

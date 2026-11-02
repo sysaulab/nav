@@ -43,11 +43,20 @@ export default function Welcome() {
   )
 }
 
+type HealthState = 'loading' | 'ok' | 'down'
+
 function SystemStatus() {
-  const [maestro, setMaestro] = useState<'loading' | 'ok' | 'down'>('loading')
-  const [ingest, setIngest] = useState<'loading' | 'ok' | 'down'>('loading')
-  const [geocoder, setGeocoder] = useState<'loading' | 'ok' | 'down'>('loading')
-  const [ollama, setOllama] = useState<'loading' | 'ok' | 'down'>('loading')
+  const [maestro, setMaestro] = useState<HealthState>('loading')
+  const [ingest, setIngest] = useState<HealthState>('loading')
+  const [geocoder, setGeocoder] = useState<HealthState>('loading')
+  const [ollama, setOllama] = useState<HealthState>('loading')
+
+  // Endpoints as reported by the backend. The pills display what maestro
+  // actually dialed — not a hardcoded string — so a wrong env var shows up
+  // as the wrong hostname instead of hiding behind a generic red dot.
+  const [ingestEndpoint, setIngestEndpoint] = useState<string | null>(null)
+  const [geocoderEndpoint, setGeocoderEndpoint] = useState<string | null>(null)
+  const [ollamaEndpoint, setOllamaEndpoint] = useState<string | null>(null)
   const [ollamaModel, setOllamaModel] = useState<string | null>(null)
 
   useEffect(() => {
@@ -55,17 +64,28 @@ function SystemStatus() {
 
     fetch('/api/health')
       .then((r) => r.json())
-      .then((d) => alive && setMaestro(d.status === 'ok' ? 'ok' : 'down'))
+      .then((d) => {
+        if (!alive) return
+        setMaestro(d.status === 'ok' ? 'ok' : 'down')
+      })
       .catch(() => alive && setMaestro('down'))
 
     fetch('/api/health/ingest')
       .then((r) => r.json())
-      .then((d) => alive && setIngest(d.ok ? 'ok' : 'down'))
+      .then((d) => {
+        if (!alive) return
+        setIngest(d.ok ? 'ok' : 'down')
+        if (typeof d.endpoint === 'string') setIngestEndpoint(d.endpoint)
+      })
       .catch(() => alive && setIngest('down'))
 
     fetch('/api/health/geocoder')
       .then((r) => r.json())
-      .then((d) => alive && setGeocoder(d.ok ? 'ok' : 'down'))
+      .then((d) => {
+        if (!alive) return
+        setGeocoder(d.ok ? 'ok' : 'down')
+        if (typeof d.endpoint === 'string') setGeocoderEndpoint(d.endpoint)
+      })
       .catch(() => alive && setGeocoder('down'))
 
     fetch('/api/health/ollama')
@@ -73,32 +93,52 @@ function SystemStatus() {
       .then((d) => {
         if (!alive) return
         setOllama(d.ok ? 'ok' : 'down')
+        if (typeof d.endpoint === 'string') setOllamaEndpoint(d.endpoint)
         if (typeof d.model === 'string') setOllamaModel(d.model)
       })
       .catch(() => alive && setOllama('down'))
 
-    return () => {
-      alive = false
-    }
+    return () => { alive = false }
   }, [])
+
+  const llmDetail = ollamaEndpoint
+    ? ollamaModel
+      ? `${shortenEndpoint(ollamaEndpoint)} · ${ollamaModel}`
+      : shortenEndpoint(ollamaEndpoint)
+    : 'loading…'
 
   return (
     <div className="mt-10 flex flex-wrap items-center justify-center gap-2">
-      <Pill tone={toneFor(maestro)} label="nav" detail="localhost:8001" />
-      <Pill tone={toneFor(ingest)}  label="doc" detail="localhost:8000/ingest" />
-      <Pill tone={toneFor(geocoder)} label="geo" detail="localhost:8080" />
+      {/* Maestro is reached via the nginx /api proxy on whatever origin the
+          browser loaded this page from — so the honest "endpoint" is our
+          own host, not the container's internal bind address. */}
       <Pill
-        tone={toneFor(ollama)}
-        label="llm"
-        detail={
-          ollamaModel ? `localhost:11434 · ${ollamaModel}` : 'localhost:11434'
-        }
+        tone={toneFor(maestro)}
+        label="nav"
+        detail={window.location.host}
       />
+      <Pill
+        tone={toneFor(ingest)}
+        label="doc"
+        detail={ingestEndpoint ? shortenEndpoint(ingestEndpoint) : 'loading…'}
+      />
+      <Pill
+        tone={toneFor(geocoder)}
+        label="geo"
+        detail={geocoderEndpoint ? shortenEndpoint(geocoderEndpoint) : 'loading…'}
+      />
+      <Pill tone={toneFor(ollama)} label="llm" detail={llmDetail} />
     </div>
   )
 }
 
-function toneFor(state: 'loading' | 'ok' | 'down'): PillTone {
+/** Strip scheme and a trailing slash for compact display.
+ *  Keeps host:port and any path — both are diagnostic. */
+function shortenEndpoint(url: string): string {
+  return url.replace(/^https?:\/\//, '').replace(/\/$/, '')
+}
+
+function toneFor(state: HealthState): PillTone {
   if (state === 'ok') return 'ok'
   if (state === 'down') return 'error'
   return 'neutral'

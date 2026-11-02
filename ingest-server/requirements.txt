@@ -1,27 +1,37 @@
 # --- Office / PDF conversion ----------------------------------------------
-officemd>=0.0.0
-docling[opendocument]>=2.0.0
-pymupdf>=1.24.0
+# officemd 0.1.8 requires CPython 3.12 wheels (cp312-abi3).
+# Do not run this on Python 3.11 — update the Docker base image to 3.12.
+officemd==0.1.8
 
-# Possibly redundant — not imported directly by router.py or reconcile.py;
-# may be a transitive dep of docling[opendocument]. Verify before removing.
-odfdo>=0.0.0
+# docling 2.113.0 is the current stable; floor must include [opendocument]
+# so odfdo is pulled in as a transitive dependency.
+docling[opendocument]==2.113.0
+pymupdf==1.24.0
 
 # --- PDF text-layer detection ---------------------------------------------
-# Required by _pdf_has_text_layer(); without it every PDF is treated as
-# scanned and routed to the (slower, costlier) OCR path.
-pypdf>=4.0.0
+# pypdf 6.x includes security hardening; 4.x is too old.
+pypdf==6.0.0
 
 # --- MIME sniffing (optional) ---------------------------------------------
-# router.py degrades gracefully to extension-based guessing if missing,
-# but false extensions will misroute files. Needs libmagic on the host:
-#   Debian/Ubuntu: apt-get install libmagic1
-#   macOS:         brew install libmagic
-python-magic>=0.4.27
+# 0.4.27 is the only current release; cap below 0.5 for safety.
+python-magic==0.4.27
 
-fastapi==0.115.0
-uvicorn[standard]==0.30.0
-rapidocr-onnxruntime==1.4.4
-python-multipart==0.0.9
-pillow==10.4.0
-numpy==1.26.4
+# Add these two lines instead:
+rapidocr==3.10.0
+onnxruntime==1.19.0
+
+# --- Web framework / server ----------------------------------------------
+# app/main.py imports fastapi directly. The Dockerfile CMD runs uvicorn.
+# python-multipart is required by Starlette's form parser: /ingest takes
+# a multipart UploadFile, so without it FastAPI raises at request time
+# (import time only catches fastapi itself).
+fastapi==0.124.2
+uvicorn[standard]==0.38.0
+python-multipart==0.0.32
+
+# --- Direct imports in app/ocr/engine.py ---------------------------------
+# Both are transitively provided by rapidocr/docling, but since they are
+# direct imports, pin them explicitly so a future rapidocr bump cannot
+# silently drop them.
+pillow==12.0.0
+numpy==2.3.5

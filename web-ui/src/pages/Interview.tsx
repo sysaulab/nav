@@ -11,6 +11,7 @@ import type {
 } from '../types'
 import FileDropzone from '../components/FileDropzone'
 import { matchesAccept } from '../util/files.tsx'
+import * as React from 'react'
 
 type Upload = { id: string; filename: string; pct: number }
 

@@ -7,6 +7,7 @@ import type {
   Organization, OrganizationIn,
   ServiceIn,
 } from '../types'
+import * as React from 'react'
 
 // ─────────────────────────────────────────────────────────────
 // Selection state carried up to the shell
