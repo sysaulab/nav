@@ -29,8 +29,8 @@ class Settings(BaseSettings):
    
     # ── location / nearby services ──────────────────────────
     postcode_radius_km: float = 25.0
-    nearby_index_limit: int = 100      # one-liners in the prompt
-    nearby_full_limit: int = 5         # rendered in full by default
+    nearby_location_limit: int = 20    # locations listed in the prompt
+    nearby_index_limit: int = 100      # total services in the index
 
     # ── document context budget ─────────────────────────────
     # 256K context − 32K generation − ~4K base prompt.

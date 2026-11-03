@@ -77,6 +77,20 @@ export default function Interview() {
 const ACCEPT =
   '.pdf,.txt,.md,.docx,.doc,.odt,.rtf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
 
+
+
+// ── helpers ───────────────────────────────────────────
+/** Local-only id for in-flight uploads (never sent to the backend). */
+function newUid(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+  return `u_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+
+
+
 async function onFiles(files: File[]) {
   if (!session || files.length === 0) return
   setError(null)
@@ -416,7 +430,7 @@ async function onFiles(files: File[]) {
                     onClick={downloadPlan}
                     className="rounded-lg border border-emerald-400 bg-white px-3 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100"
                   >
-                    Download .md
+                    📄 Markdown
                   </button>
                   <button
                     type="button"
@@ -424,7 +438,7 @@ async function onFiles(files: File[]) {
                     disabled={exportingDocx}
                     className="rounded-lg border border-emerald-400 bg-white px-3 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100 disabled:opacity-50"
                   >
-                    {exportingDocx ? 'Preparing…' : 'Download .docx'}
+                    {exportingDocx ? '📄 Preparing…' : '📄 Office'}
                   </button>
                 </div>
               )}
@@ -890,11 +904,47 @@ function LocationGate({
   )
 }
 
+
 // ─────────────────────────────────────────────────────────────
 // Service card rendered inline in the chat flow
 // ─────────────────────────────────────────────────────────────
 function ServiceCardView({ card }: { card: ServiceCard }) {
   const s = card.service
+  const [copied, setCopied] = useState(false)
+
+  async function copyCard() {
+    const lines: string[] = [
+      `${s.category} — ${s.distance_km.toFixed(1)} km`,
+      s.name,
+    ]
+    const place = [s.location_name, s.address].filter(Boolean).join(' — ')
+    if (place) lines.push(place)
+    if (s.description) lines.push(s.description)
+    if (s.eligibility_description) lines.push(`Eligibility: ${s.eligibility_description}`)
+    if (s.application_process) lines.push(`How to apply: ${s.application_process}`)
+    if (s.fees_description) lines.push(`Fees: ${s.fees_description}`)
+    if (s.email) lines.push(`Email: ${s.email}`)
+    if (s.url) lines.push(`URL: ${s.url}`)
+
+    const text = lines.join('\n')
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      // Fallback for browsers / contexts where the async clipboard API is
+      // unavailable (non-HTTPS, older Safari).
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      try { document.execCommand('copy') } catch { /* ignore */ }
+      ta.remove()
+    }
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1500)
+  }
+
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
       <div className="flex items-baseline justify-between gap-3">
@@ -906,7 +956,17 @@ function ServiceCardView({ card }: { card: ServiceCard }) {
             {s.category}
           </span>
         </div>
-        <span className="text-xs text-slate-500">{s.distance_km.toFixed(1)} km</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-slate-500">{s.distance_km.toFixed(1)} km</span>
+          <button
+            type="button"
+            onClick={() => void copyCard()}
+            className="rounded-md border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-slate-50"
+            aria-live="polite"
+          >
+            {copied ? 'Copied!' : 'Copy'}
+          </button>
+        </div>
       </div>
       <h3 className="mt-1 text-base font-semibold text-slate-900">{s.name}</h3>
       {(s.location_name || s.address) && (

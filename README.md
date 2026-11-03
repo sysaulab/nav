@@ -1,216 +1,231 @@
+
 # Local Resource Navigator
 
-Two cooperating services for turning a person's documents and location into concrete, actionable referrals to nearby social services. Built for **single-tenant, single-user workstation** deployments — no auth, no multi-tenancy, no horizontal scaling. Bind to `127.0.0.1` unless you know what you're exposing.
+Two services that help a caseworker connect a client to local services. The **sanitizer** turns documents into canonical JSON. The **navigator** runs the interview, keeps per-visitor state, and orchestrates the LLM. A React front end sits on top of the navigator.
 
 ```
-┌──────────────┐    upload     ┌───────────────────┐    sanitized    ┌──────────────┐
-│   browser    │ ────────────▶ │   nav-server      │ ──────────────▶ │ ingest-server│
-│  (caseworker │               │   (port 8001)     │      JSON       │  (port 8000) │
-│   / client)  │ ◀──────────── │   FastAPI+SQLite  │ ◀────────────── │  FastAPI+OCR │
-└──────────────┘  NDJSON chat  └─────────┬─────────┘                 └──────────────┘
-                                          │
-                       ┌──────────────────┼──────────────────┐
-                       ▼                  ▼                  ▼
-                ┌────────────┐     ┌────────────┐     ┌────────────┐
-                │  Nominatim │     │   Ollama   │     │  local DB  │
-                │ (geocoding)│     │  (LLM chat │     │  (SQLite)  │
-                │  port 8080 │     │  + plan)   │     │            │
-                └────────────┘     └────────────┘     └────────────┘
+browser ──► nav-ui (nginx :80) ──► nav (FastAPI :8001) ──► SQLite (nav.db)
+                                        │
+                                        ├──► sanitizer (FastAPI :8000)  ← document uploads
+                                        ├──► Nominatim                   ← address → lat/lng
+                                        └──► Ollama                      ← chat + finalize
 ```
 
-## What's in here
-
-| Directory | Service | Port | Role |
-|---|---|---|---|
-| [`ingest-server/`](ingest-server/) | **Document Sanitizer** | 8000 | Turns PDFs, Office docs, images, and plain text into one canonical JSON shape — per-page blocks, bounding boxes, confidence, quality verdict. OCR runs in-process (RapidOCR). |
-| [`nav-server/`](nav-server/) | **Navigator** | 8001 | Interview orchestration. Manages ephemeral sessions, forwards uploads to the sanitizer, budgets documents against an LLM context window, streams chat and a final action plan from Ollama, and localizes nearby services via Nominatim. |
-
-Each service is independently runnable. The navigator treats the sanitizer as an opaque HTTP dependency — you can swap it for anything that returns the same JSON shape (see `ingest-server/REDME.md` § *Output format*).
-
-> **Note:** the sanitizer's README lives at [`ingest-server/REDME.md`](ingest-server/REDME.md) (filename typo — worth renaming to `README.md`). It is the authoritative reference for the canonical output schema and exit codes.
+The sanitizer is stateless — no sessions, no cookies, no LLM. The navigator is stateful — it owns the directory DB, sessions, and uploaded-document metadata.
 
 ---
 
-## Quick start
+## INSTALL — what you need first
 
-### 1. System dependencies (host, not container)
+On the host:
+
+- **Docker Engine + Compose v2.**
+- **Ollama** running on the host, reachable at `host.docker.internal:11434`. Pull two models:
+  ```bash
+  ollama pull gemma4:cloud      # chat model
+  ollama pull beam:cloud        # final-plan model
+  ```
+  Swap these for any others by setting `OLLAMA_MODEL` / `FINAL_MODEL` in `.env` (see Configuration below) — assuming `compose.yaml` reads them.
+- **A Nominatim instance.** `compose.yaml` presumably defines one (`nominatim-bc`) and the navigator's default `NOMINATIM_ENDPOINT` matches. If not, point `NAVIGATOR_NOMINATIM_ENDPOINT` at any Nominatim-compatible URL — the public one works but rate-limits hard.
+- **~4 GB RAM** on first ingest, for the sanitizer's OCR + docling model caches. Steady-state is much lower.
+
+No host Python, no host Node, no host pandoc.
+
+---
+
+## INSTALL — bring it up
 
 ```bash
-# Debian / Ubuntu
-sudo apt-get install -y libmagic1 libgl1 libglib2.0-0 libgomp1
-# macOS
-brew install libmagic
+git clone <repo> && cd <repo>
+docker compose up --build -d
 ```
 
-`libmagic` is required for MIME sniffing in the sanitizer. Without it the router falls back to extension-based guessing and silently misroutes renamed files. The GL/GLib/Gomp libs back OCR (RapidOCR → ONNX Runtime → OpenCV-headless).
+First build takes several minutes:
 
-### 2. Sanitizer
+- `sanitizer` installs CPU-only torch, then warms RapidOCR + Docling model caches into `/opt/models` (a few hundred MB).
+- `nav-ui` runs a Vite build, then copies `dist/` into nginx.
+- `nav` is a small install.
+
+Check status:
 
 ```bash
-cd ingest-server
-python3 -m venv .venv && . .venv/bin/activate
+docker compose ps                       # all services "running"
+docker compose logs -f nav              # follow the navigator
+```
+
+Open **`http://localhost:8080`** — that's the UI. The status pills at the bottom of the welcome page should turn green for `nav`, `doc`, `geo`, and `llm`. A pill that stays red names the endpoint it failed to reach; that's the fastest way to spot a mis-set environment variable.
+
+---
+
+## INSTALL — smoke test
+
+1. **Welcome page.** Four green pills. If `doc` is red, the sanitizer isn't up — `docker compose logs sanitizer`. If `llm` is red, Ollama on the host isn't reachable — check `docker compose logs nav | grep ollama`.
+2. **`/interview`.** You should land on the location gate ("Where are you located?"). Type a postal code — the autocomplete should populate from `geo`. Pick one.
+3. **Upload a PDF.** Any small one. It should appear in the Documents panel with a token count, and the "context budget" bar should move.
+4. **Send a chat turn.** The assistant should respond. If it hangs, `llm` is unreachable or the model name is wrong.
+5. **Finish.** The plan renders in the green box; "Download .docx" produces a valid file (exercises the pandoc subprocess).
+6. **Close the tab, reopen.** A fresh session is created; the previous one is orphaned and will be swept in ~15 min by the purge loop.
+
+If all six pass, you have a working install. If any fail, the failure names the layer.
+
+---
+
+## INSTALL — dev mode (no Docker)
+
+When you're editing the code and want hot reload. **Note the Python versions differ**: the navigator runs on 3.11+, but the sanitizer's `officemd==0.1.8` requires **3.12** wheels. Use separate virtualenvs.
+
+**Sanitizer** (port 8000):
+```bash
+cd sanitizer
+python3.12 -m venv .venv && . .venv/bin/activate
+sudo apt-get install -y libmagic1 libgl1 libglib2.0-0 libgomp1   # Debian/Ubuntu
 pip install -r requirements.txt
-python -m app.main                       # 127.0.0.1:8000
+python -m app.main --host 127.0.0.1 --port 8000
 ```
 
-First run downloads RapidOCR + Docling model caches into `~/.cache` (~500 MB, several minutes). Set `XDG_CACHE_HOME=/opt/models` to relocate.
-
-### 3. Navigator
-
+**Navigator** (port 8001):
 ```bash
-cd nav-server
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[tokenizer]"            # tokenizer extra = accurate prompt budgeting
-python -m navigator                      # 127.0.0.1:8001
-```
-
-Point it at the running sanitizer, a Nominatim instance, and Ollama:
-
-```bash
+cd nav
+python3.11 -m venv .venv && . .venv/bin/activate
+sudo apt-get install -y pandoc                                   # for DOCX export
+pip install -e .
 NAVIGATOR_SANITIZER_ENDPOINT=http://127.0.0.1:8000/ingest \
 NAVIGATOR_NOMINATIM_ENDPOINT=http://127.0.0.1:8080 \
 NAVIGATOR_OLLAMA_ENDPOINT=http://127.0.0.1:11434 \
-python -m navigator
+python -m navigator --host 127.0.0.1 --port 8001
 ```
 
-Nominatim and Ollama are not part of this repo — run them yourself (`mediagis/nominatim` and `ollama/ollama` are good starting points) or use hosted instances.
-
-### 4. Docker
-
-Each service has its own Dockerfile.
-
+**UI** (port 5173, hot reload):
 ```bash
-docker build -t sanitizer  ingest-server/
-docker build -t navigator  nav-server/
+cd nav-ui
+npm ci
+npm run dev
+# Vite proxies /api → http://127.0.0.1:8001 (see vite.config.ts)
 ```
 
-The navigator Dockerfile expects the sanitizer, Nominatim, and Ollama to be reachable at hostnames `sanitizer`, `nominatim`, and `ollama` — either via a compose file or a shared Docker network:
-
-```yaml
-# illustrative — you'll need to supply the Nominatim + Ollama services
-services:
-  sanitizer:
-    build: ./ingest-server
-    ports: ["8000:8000"]
-  navigator:
-    build: ./nav-server
-    ports: ["8001:8001"]
-    volumes: ["./data:/data"]
-    depends_on: [sanitizer]
-```
-
-**Do not** run multiple replicas of the sanitizer without replacing its `_ingest_lock` with a distributed primitive — it serializes OCR per process by design, and the Dockerfile pins `--workers 1` to match.
+Open `http://localhost:5173`. Same smoke test applies. On macOS the `apt-get` lines don't apply — `brew install libmagic pandoc` covers both.
 
 ---
 
-## Data flow
+## The navigator is multi-session by design
 
-1. **`POST /api/interviews`** — the navigator mints a session, sets an HttpOnly `nav_session` cookie, and starts a 15-minute idle TTL.
-2. **`POST /api/interviews/{sid}/location`** — the caseworker submits a postal code (or picks an autocomplete candidate from `/api/geocode/search`). The navigator geocodes it via Nominatim and stores `origin_lat/lng`. **Chat and finalize refuse to run until this is set.**
-3. **`POST /api/interviews/{sid}/documents`** — the navigator forwards the upload to the sanitizer's `/ingest`, then keeps only the fields the LLM needs (`sanitize.filter_sanitizer_output`): filename, page count, quality, per-page blocks with `block_id`, `text`, `table_data`, `min_confidence`. Bounding boxes, MIME provenance, and rollup confidence are dropped. Nothing is written to disk; only the filtered JSON is stored in `session_document.payload_json`.
-4. **`POST /api/interviews/{sid}/chat`** — the navigator assembles a system prompt (base instructions + rendered documents + nearby services) and proxies to Ollama's `/api/chat`, streaming NDJSON back to the client unmodified.
-5. **`POST /api/interviews/{sid}/finalize`** — same context, different system prompt and model (`NAVIGATOR_FINAL_MODEL`, default `beam:cloud`). Streams the final prioritized action plan.
+Every visitor gets their own `InterviewSession` row, created on demand and identified by an httpOnly cookie (`nav_session`). The session ID is a UUID; it acts as a bearer token, and every authenticated endpoint re-checks that the request's cookie matches the row it's about to touch.
 
-Sessions are wiped on `DELETE /api/interviews/{sid}` and on a background 30-second TTL sweep. Deleting a session cascades to its documents.
+Each session owns, independently: its origin (postal code, lat/lng, short display name), its **fixed, distance-ordered nearby-services index** (`nearby_service_ids`), its set of expanded service entries (`revealed_service_indices`), its uploaded documents (FK with `ondelete="CASCADE"`), and its sliding `expires_at` deadline.
 
-### Prompt budgeting
+Nothing is global except the service directory itself.
 
-The context budget is **220,000 tokens** (configurable) — sized for a 256 K context window with room for generation and base prompt. Documents are consumed oldest-first; a document that would exceed the budget is **skipped, not truncated**, so a large early upload doesn't block a smaller later one. Skipped documents are reported back to the user via `context-prompt` and the system prompt itself.
+---
 
-Token estimation uses a real Gemma tokenizer when available (`transformers` extra), falling back to a conservative `chars/3.5` heuristic. The Dockerfile bakes the tokenizer into the image so the first request doesn't hit the network.
+## Session lifecycle
+
+**Create or resume.** `POST /interviews` looks for the cookie. If the row exists, is `active`, and hasn't expired, it slides the deadline forward and returns it. If the cookie points at a dead row, that row is deleted and a fresh one is minted.
+
+**Location gate.** Chat and finalize refuse to run until a postal code has been resolved to lat/lng. Setting the location rebuilds the nearby-services index in one transaction — both `nearby_service_ids` and `revealed_service_indices` are reset together, so `[07]` never means a different service before and after a move.
+
+**Sliding TTL.** Every authenticated request extends `expires_at` by `session_idle_minutes` (default 15). A session goes `expired` when the deadline has passed *and* a request arrives — but the purge loop sweeps it independently.
+
+**Background purge.** A startup task loops every `session_purge_interval_s` (default 30s) and deletes rows whose `expires_at` is in the past. Deleting a session cascades away its documents.
+
+**End.** `DELETE /interviews/{sid}` deletes the row (and its documents) immediately, provided the cookie matches.
+
+---
+
+## Isolation guarantees
+
+- **No cross-session reads.** Every endpoint that takes a `{sid}` path parameter compares it against the request's cookie *before* loading the row. A guess at another visitor's UUID returns 404, not a leak.
+- **No cross-session writes.** Document uploads are scoped by `session_id` on the row; chat and finalize re-derive context from the row identified by the cookie, not from client-supplied state.
+- **Documents die with their session.** `ondelete="CASCADE"` on `SessionDocument.session_id` is only effective because `PRAGMA foreign_keys=ON` is set at connect time (`nav/navigator/db.py`). Without it, session deletes would orphan documents silently.
+- **Prompt context is per-session.** `_build_chat_context` re-queries documents, origin, and nearby services fresh for every chat turn. There is no shared prompt state.
+
+---
+
+## Concurrency model
+
+The navigator handles many sessions concurrently in **one event loop, one process**. `uvicorn.run(create_app(...), ...)` in `nav/navigator/main.py` passes no `workers` argument, so it defaults to 1. Concurrency comes from asyncio, not from multiple processes.
+
+That's the correct shape for this workload: almost everything blocking lives off-process — SQLite via aiosqlite, the sanitizer via httpx, Nominatim via httpx, Ollama via httpx, pandoc via `asyncio.create_subprocess_exec`. The event loop stays responsive because no handler holds the GIL for long.
+
+Three intentional serialization points:
+
+**1. SQLite writes.** WAL is enabled (`PRAGMA journal_mode=WAL`), so reads do not block writes and vice versa. SQLite still serializes writers — two concurrent inserts queue. With per-visitor sessions, writes are short and infrequent; this is why the navigator is single-process rather than multi-worker. `workers > 1` on the same SQLite file would need a `busy_timeout` the current code doesn't set. Reads — the vast majority of traffic — scale freely under WAL.
+
+**2. Sanitizer ingest.** `_ingest_lock = threading.Lock()` in `sanitizer/app/main.py` serializes `/ingest` across the process. Two concurrent uploads from two sessions queue. Deliberate: it bounds peak memory to one ingest's working set. The cost is real — one caseworker uploading while another uploads waits. `/health` and `/ready` are intentionally outside the lock so a hung ingest can't make liveness hang with it.
+
+**3. Ollama inference.** Ollama serves one generation at a time per model. Two sessions chatting simultaneously queue at Ollama. The navigator doesn't try to serialize this itself — Ollama is the source of truth for that constraint.
+
+---
+
+## What is per-session vs shared
+
+| | Per-session | Shared |
+|---|---|---|
+| Database | `InterviewSession` row, `SessionDocument` rows | `Organization`, `Location`, `Service`, `ServiceAtLocation` |
+| Coordinates | `origin_lat`, `origin_lng` | (address → coords lookup is stateless) |
+| Nearby services | `nearby_service_ids`, `revealed_service_indices` | Service rows themselves |
+| Document payloads | `SessionDocument.payload_json` | (sanitizer has no retained state) |
+| LLM context | Built fresh per request from the session row | (Ollama is stateless per request) |
+| Cookie | `nav_session` per browser | (n/a) |
+
+---
+
+## The interview flow, end to end
+
+1. Browser loads `/`, sees status pills populated from `/api/health*` — each pill reports the actual endpoint the backend dialed.
+2. Opens `/interview`. `POST /interviews` creates a session and sets the cookie.
+3. Location gate: debounced autocomplete against `/api/geocode/search`; the chosen candidate is posted to `/interviews/{sid}/location`, which geocodes (or trusts the candidate), builds the nearby-services index, and resets `revealed_service_indices`.
+4. Uploads: multipart POST to `/interviews/{sid}/documents`, forwarded to the sanitizer, filtered, token-estimated, stored. Per-document status (`ready`, `skipped_too_large`, `quarantine`) is surfaced in the UI alongside a live token-budget bar.
+5. Chat: `POST /interviews/{sid}/chat` streams NDJSON from Ollama with a `get_service_details(index)` tool. Tool results stay server-side; expanded services are also promoted into the next turn's system prompt so the model doesn't re-request them.
+6. Finalize: `POST /interviews/{sid}/finalize` reuses the same context assembly against a different base prompt and a different model. The plan streams back the same way.
+7. Export: `/api/export/docx` pipes the plan's Markdown through pandoc (stdin → stdout, `-o -`, no temp files) for a `.docx` download.
+
+Any step that 404s/409s/410s a session (cookie missing, expired, ended, purged) drives the front end to the "session expired" modal rather than a generic error.
 
 ---
 
 ## Configuration
 
-Both services are pure env-var driven. Defaults assume `127.0.0.1` co-location.
+Everything env-driven; `NAVIGATOR_` prefix on the navigator, `SANITIZER_` prefix on the sanitizer. `compose.yaml` is the source of truth for what's actually set in the container; the table below lists what the code *reads* and what happens if it's absent.
 
-### Sanitizer (`SANITIZER_*`)
+Navigator defaults worth knowing:
 
-| Variable | Default | Meaning |
+| Setting | Default | Meaning |
 |---|---|---|
-| `SANITIZER_MAX_UPLOAD_BYTES` | `104857600` (100 MiB) | Hard cap on any single ingest |
-| `SANITIZER_MAX_PAGES` | `500` | Page cap; exceeding it quarantines (never truncates) |
-| `SANITIZER_LOW_CONFIDENCE_THRESHOLD` | `0.65` | Blocks below this are listed in `rollup.low_confidence_block_ids` |
-| `SANITIZER_LOG_LEVEL` | `INFO` | `DEBUG` for per-file detail |
-| `XDG_CACHE_HOME` / `HF_HOME` | `~/.cache` | Model cache location |
-
-### Navigator (`NAVIGATOR_*`)
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `NAVIGATOR_DATABASE_URL` | `sqlite+aiosqlite:///./navigator.db` | SQLAlchemy URL; Docker uses `…:////data/navigator.db` |
-| `NAVIGATOR_SANITIZER_ENDPOINT` | `http://127.0.0.1:8000/ingest` | Where uploads are forwarded |
+| `NAVIGATOR_DATABASE_URL` | `sqlite+aiosqlite:///./navigator.db` | SQLite via aiosqlite |
+| `NAVIGATOR_SANITIZER_ENDPOINT` | `http://127.0.0.1:8000/ingest` | Sanitizer POST target |
 | `NAVIGATOR_NOMINATIM_ENDPOINT` | `http://127.0.0.1:8080` | Geocoder base URL |
-| `NAVIGATOR_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | LLM base URL |
-| `NAVIGATOR_OLLAMA_MODEL` | `gemma4:cloud` | Chat model |
-| `NAVIGATOR_FINAL_MODEL` | `beam:cloud` | Finalize model |
-| `NAVIGATOR_DOCUMENT_BUDGET_TOKENS` | `220000` | Prompt token budget |
-| `NAVIGATOR_MAX_DOCUMENTS_PER_SESSION` | `50` | Upload cap |
-| `NAVIGATOR_SESSION_IDLE_MINUTES` | `15` | Sliding TTL |
-| `NAVIGATOR_POSTCODE_RADIUS_KM` | `25.0` | Nearby-services search radius |
-| `NAVIGATOR_NEARBY_SERVICES_LIMIT` | `20` | Cap on services injected into prompt |
-| `NAVIGATOR_TOKENIZER_MODEL` | `google/gemma-2-2b-it` | HF tokenizer used for estimation |
+| `NAVIGATOR_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | Ollama base URL |
+| `NAVIGATOR_SESSION_IDLE_MINUTES` | `15` | Sliding TTL per session |
+| `NAVIGATOR_SESSION_PURGE_INTERVAL_S` | `30` | Background sweep cadence |
+| `NAVIGATOR_MAX_DOCUMENTS_PER_SESSION` | `50` | Per-session upload cap |
+| `NAVIGATOR_DOCUMENT_BUDGET_TOKENS` | `220_000` | Prompt budget per chat turn |
+| `NAVIGATOR_POSTCODE_RADIUS_KM` | `25.0` | Nearby-services radius |
+| `NAVIGATOR_NEARBY_FULL_LIMIT` | `5` | How many services render in full by default |
+
+Sanitizer defaults (see `sanitizer/README.md`): `SANITIZER_MAX_UPLOAD_BYTES = 100 MiB`, `SANITIZER_MAX_PAGES = 500`, `SANITIZER_LOW_CONFIDENCE_THRESHOLD = 0.65`. All safety valves, not functional constraints.
 
 ---
 
-## Development
+## Known limits
 
-```bash
-# Sanitizer — CLI mode (one file per invocation; exits 0/1/2/1000)
-cd ingest-server
-python -m app.main examples/scan.pdf 2>/dev/null | jq .
-python -m app.main --help             # exit-code contract
-
-# Navigator
-cd nav-server
-pytest                                 # if tests/ exists
-python -m navigator --db-url sqlite+aiosqlite:///./dev.db
-```
-
-When a document misbehaves end-to-end, work backwards:
-
-1. `source.route` / `source.converter` in the sanitizer's response tells you which handler ran.
-2. `quality.status == "quarantine"` → `quality.reasons[0]` is the summary; the `ingest.error` traceback is on the sanitizer's stderr.
-3. `GET /api/interviews/{sid}/context-prompt` on the navigator shows exactly what the LLM will see — including which documents were skipped and why.
-
-## Layout
-
-```
-.
-├── ingest-server/           Document Sanitizer (port 8000)
-│   ├── app/
-│   │   ├── main.py          FastAPI app + CLI entry point
-│   │   ├── router.py        Extension/MIME dispatch
-│   │   ├── settings.py      Env-driven config
-│   │   ├── models.py        Pydantic Document / Page / Block
-│   │   ├── handlers/        Per-format handlers (office, docling, pdf, image, text, quarantine)
-│   │   └── ocr/             RapidOCR wrapper + reading-order reconciliation
-│   ├── Dockerfile           Pinned Python, CPU-only torch, one worker
-│   └── REDME.md             Sanitizer reference (schema, routes, exit codes)
-│
-└── nav-server/              Navigator (port 8001)
-    ├── navigator/
-    │   ├── main.py          FastAPI factory, startup migrations, purge loop, health, geocode
-    │   ├── config.py        Pydantic settings (NAVIGATOR_* prefix)
-    │   ├── db.py            Async SQLAlchemy engine + session
-    │   ├── models.py        HSDS-style ORM (org / location / service / …)
-    │   ├── schemas.py       Request/response models
-    │   ├── prompt.py        System prompt assembly + document rendering
-    │   ├── sanitize.py      Prune sanitizer output to LLM-relevant fields
-    │   ├── tokens.py        Tokenizer-or-heuristic token counting
-    │   ├── geocode.py       Short display-name derivation
-    │   └── routers/         organizations, locations, services,
-    │                        service_at_location, nested, interviews
-    ├── pyproject.toml
-    └── Dockerfile           Bakes HF tokenizer; expects sanitizer/nominatim/ollama on the network
-```
+- **One navigator process, one sanitizer worker.** Multi-worker on SQLite would need `busy_timeout`; multi-worker on the sanitizer would need to replace `_ingest_lock`.
+- **Uploads serialize.** Two concurrent uploads from different sessions queue at the sanitizer. This is the main user-facing cost of the current architecture.
+- **No auth on the sanitizer.** It's intended to be reachable only by the navigator. Never publish it on a public interface.
+- **SQLite writes serialize.** WAL makes reads concurrent; writes still queue. Fine at this workload, not a starting point for high-write use.
+- **Sessions die hard.** No "recover an ended session" — the cascade is real, and the UI has no affordance for it.
+- **The tokenizer heuristic is conservative.** Falls back to `chars / 3.5` if `transformers` is unavailable or the model isn't cached. Over-estimation excludes a document early; under-estimation would truncate output, so the heuristic under-divides on purpose.
 
 ---
 
-## Where to read next
+## Where things live
 
-- **Sanitizer contract** — [`ingest-server/REDME.md`](ingest-server/README.md): output schema, routing rules, quarantine reasons, CLI exit codes, upload-size enforcement.
-- **Interview flow** — [`nav-server/navigator/routers/interviews.py`](nav-server/navigator/routers/interviews.py): the sole orchestrator, documented endpoint-by-endpoint at the top of the file.
-- **Prompt shape** — [`nav-server/navigator/prompt.py`](nav-server/navigator/prompt.py) and [`sanitize.py`](nav-server/navigator/sanitize.py): exactly which fields survive the round-trip into the LLM.
-- **Data model** — [`nav-server/navigator/models.py`](nav-server/navigator/models.py): HSDS-aligned `Organization` → `Location` → `Service` → `ServiceAtLocation`, plus the `LiveOccupancy` extension and `InterviewSession` / `SessionDocument` tables.
+```
+compose.yaml   service wiring — the source of truth for container config
+sanitizer/     document pipeline, stateless, CLI + HTTP
+nav/           navigator FastAPI backend
+nav-ui/        React front end (Vite + Tailwind)
+```
+
+The sanitizer container should be built with `--secret id=hf_token` only if `INSTALL_TOKENIZER=1` — the tokenizer is not needed for correctness, only for tight prompt budgets.
+
+The navigator's SQLite file lives at `/data/navigator.db` in the container (`NAVIGATOR_DATABASE_URL`). It is the only durable state in the whole system — back it up, or accept that the directory is disposable.

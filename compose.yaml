@@ -43,7 +43,7 @@ services:
       # gemma4:cloud and beam:cloud are Ollama Cloud tags. If your
       # external Ollama is signed in to Ollama Cloud, these just work.
       NAVIGATOR_OLLAMA_MODEL: "gemma4:cloud"
-      NAVIGATOR_FINAL_MODEL: "beam:cloud"
+      NAVIGATOR_FINAL_MODEL: "nemotron-3-ultra:cloud"
 
     depends_on:
       sanitizer: 
