@@ -4,7 +4,7 @@ services:
   # ── Document Sanitizer ───────────────────────────────────
   sanitizer:
     build:
-      context: ./ingest-server
+      context: ./sanitizer
       dockerfile: dockerfile          # lowercase filename in the repo
     image: navigator/sanitizer:local
     ports:
@@ -19,7 +19,7 @@ services:
   # ── Navigator (interview orchestration) ──────────────────
   nav:
     build:
-      context: ./nav-server
+      context: ./nav
       dockerfile: dockerfile
     image: navigator/nav-server:local
     ports:
@@ -46,7 +46,8 @@ services:
       NAVIGATOR_FINAL_MODEL: "beam:cloud"
 
     depends_on:
-      sanitizer:
+      sanitizer: 
+        condition: service_started
       nominatim-bc:
         condition: service_started
     restart: unless-stopped
@@ -57,19 +58,21 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      PBF_URL: "https://download.geofabrik.de/north-america/canada/quebec-latest.osm.pbf"
-      REPLICATION_URL: "https://download.geofabrik.de/north-america/canada/quebec-updates/"
+      PBF_URL: "https://download.geofabrik.de/north-america/canada/british-columbia-latest.osm.pbf"
+      REPLICATION_URL: "https://download.geofabrik.de/north-america/canada/british-columbia-updates/"
       NOMINATIM_PASSWORD: "change-me"
     volumes:
       - nominatim-data:/var/lib/postgresql/14/main
+      - nominatim-pbf:/nominatim-pbf
     shm_size: 1gb
     restart: unless-stopped
 
   nav-ui:
-    build: ./web-ui
+    build: ./nav-ui
     ports: ["80:80"]
     depends_on: [nav]
 
 volumes:
   navigator-data:
   nominatim-data:
+  nominatim-pbf:
