@@ -43,8 +43,8 @@ RUN useradd -m -u 1000 maestro \
 USER maestro
 
 ENV NAVIGATOR_DATABASE_URL="sqlite+aiosqlite:////data/navigator.db" \
-    NAVIGATOR_SANITIZER_ENDPOINT="http://host.docker.internal:8000/ingest" \
-    NAVIGATOR_NOMINATIM_ENDPOINT="http://host.docker.internal:8080" \
+    NAVIGATOR_SANITIZER_ENDPOINT="http://sanitizer:8000/ingest" \
+    NAVIGATOR_NOMINATIM_ENDPOINT="http://nominatim-bc:8080" \
     NAVIGATOR_OLLAMA_ENDPOINT="http://host.docker.internal:11434"
 
 EXPOSE 8001

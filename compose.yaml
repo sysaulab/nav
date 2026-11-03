@@ -17,19 +17,21 @@ services:
     restart: unless-stopped
 
   # ── Navigator (interview orchestration) ──────────────────
-  navigator:
+  nav:
     build:
       context: ./nav-server
       dockerfile: dockerfile
     image: navigator/nav-server:local
     ports:
       - "127.0.0.1:8001:8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - navigator-data:/data
     environment:
       NAVIGATOR_DATABASE_URL: "sqlite+aiosqlite:////data/navigator.db"
       NAVIGATOR_SANITIZER_ENDPOINT: "http://sanitizer:8000/ingest"
-      NAVIGATOR_NOMINATIM_ENDPOINT: "http://nominatim:8080"
+      NAVIGATOR_NOMINATIM_ENDPOINT: "http://nominatim-bc:8080"
 
       # ── External Ollama ──────────────────────────────────
       # Point this at the host machine (or wherever your Ollama is
@@ -45,11 +47,12 @@ services:
 
     depends_on:
       sanitizer:
+      nominatim-bc:
         condition: service_started
     restart: unless-stopped
 
   # ── Nominatim (geocoder) ─────────────────────────────────
-  nominatim:
+  nominatim-bc:
     image: mediagis/nominatim:4.4
     ports:
       - "127.0.0.1:8080:8080"
@@ -61,6 +64,11 @@ services:
       - nominatim-data:/var/lib/postgresql/14/main
     shm_size: 1gb
     restart: unless-stopped
+
+  nav-ui:
+    build: ./web-ui
+    ports: ["80:80"]
+    depends_on: [nav]
 
 volumes:
   navigator-data:
