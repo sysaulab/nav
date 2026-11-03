@@ -7,3 +7,4 @@ nav-server/navigator.db-wal
 /web-ui/node_modules
 /web-ui/node_modules
 ingest-server/src/m4bmaker/
+/sanitizer/src/m4bmaker
