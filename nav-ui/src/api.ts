@@ -28,12 +28,48 @@ export function isSessionError(err: unknown): boolean {
   )
 }
 
+// ── request observability ─────────────────────────────────
+// The server slides the session deadline on every authenticated
+// request. Because the browser is the one initiating every such
+// request, the client already has the same information the server
+// uses — we just need to surface "a request was sent" to any
+// interested component (currently: the session countdown pill).
+//
+// Listeners are called *before* the fetch starts, not after. The
+// server slides when it processes the request; the send time is
+// the closest local proxy for that. A request that never reaches
+// the server would leave the client optimistically reset — the
+// next real request corrects it, which is a better trade than a
+// two-hop round-trip on every call.
+
+type RequestListener = (sentAtMs: number) => void
+let requestListeners: RequestListener[] = []
+
+export function onRequest(fn: RequestListener): () => void {
+  requestListeners.push(fn)
+  return () => {
+    requestListeners = requestListeners.filter((f) => f !== fn)
+  }
+}
+
+function notifyRequestSent() {
+  const t = Date.now()
+  for (const f of requestListeners) {
+    try {
+      f(t)
+    } catch {
+      /* a listener must never break a request */
+    }
+  }
+}
+
 async function parseError(res: Response): Promise<Error> {
   const detail = await res.text()
   return new ApiError(res.status, detail)
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  notifyRequestSent()
   const res = await fetch(`${BASE}${path}`, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
@@ -73,6 +109,7 @@ function uploadMultipart<T>(
     xhr.onerror = () => reject(new Error('network error'))
     const body = new FormData()
     body.append('file', file)
+    notifyRequestSent()
     xhr.send(body)
   })
 }
@@ -83,6 +120,7 @@ async function streamNdjson(
   messages: import('./types').ChatMessage[],
   onChunk: (obj: unknown) => void,
 ): Promise<void> {
+  notifyRequestSent()
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

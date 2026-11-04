@@ -13,7 +13,7 @@ import FileDropzone from '../components/FileDropzone'
 import { matchesAccept } from '../util/files.tsx'
 import * as React from 'react'
 import { usePrivacy } from '../privacy/PrivacyContext'
-
+import { SessionClock } from '../components/SessionClock'
 
 type Upload = { id: string; filename: string; pct: number }
 
@@ -50,6 +50,8 @@ export default function Interview() {
     return false
   }, [])
 
+
+  
   // ── bootstrap ─────────────────────────────────────────
   useEffect(() => {
     let live = true
@@ -80,7 +82,16 @@ export default function Interview() {
 const ACCEPT =
   '.pdf,.txt,.md,.docx,.doc,.odt,.rtf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
 
-
+async function verifyExpired() {
+  if (!session) return
+  try {
+    // Any authenticated GET refreshes the server deadline. If it succeeds,
+    // the deadline slides and the pill disappears on the next tick.
+    await api.interviews.location(session.id)
+  } catch (e) {
+    if (isSessionError(e)) setSessionExpired(true)
+  }
+}
 
 // ── helpers ───────────────────────────────────────────
 /** Local-only id for in-flight uploads (never sent to the backend). */
@@ -384,6 +395,10 @@ async function onFiles(files: File[]) {
                 {session.origin_display_name || session.postal_code}
               </span>
             </span>
+            <SessionClock
+              seedExpiresAt={session.expires_at}
+              onExpired={() => void verifyExpired()}
+            />
           </div>
           <div className="flex items-center gap-2">
             {!planHasContent && (

@@ -9,6 +9,9 @@ services:
     image: navigator/sanitizer:local
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - sanitizer-rapidocr-cache:/home/app/.cache/rapidocr
+      - sanitizer-docling-cache:/home/app/.cache/docling
     environment:
       SANITIZER_LOG_LEVEL: INFO
       SANITIZER_MAX_UPLOAD_BYTES: "104857600"
@@ -31,8 +34,12 @@ services:
     environment:
       NAVIGATOR_DATABASE_URL: "sqlite+aiosqlite:////data/navigator.db"
       NAVIGATOR_SANITIZER_ENDPOINT: "http://sanitizer:8000/ingest"
-      NAVIGATOR_NOMINATIM_ENDPOINT: "http://nominatim-bc:8080"
       NAVIGATOR_PHOTON_ENDPOINT: "http://photon:2322"
+
+      # Nominatim is not part of the pilot stack. All geocoding goes
+      # through Photon. Uncomment + restore the `nominatim-bc` service
+      # when the `/lookup` canonical-resolution step lands.
+      # NAVIGATOR_NOMINATIM_ENDPOINT: "http://nominatim-bc:8080"
 
       # ── External Ollama ──────────────────────────────────
       # Point this at the host machine (or wherever your Ollama is
@@ -49,33 +56,16 @@ services:
     depends_on:
       sanitizer:
         condition: service_started
-      nominatim-bc:
-        condition: service_started
       photon:
         condition: service_started
     restart: unless-stopped
 
-  # ── Nominatim (geocoder) ─────────────────────────────────
-  nominatim-bc:
-    image: mediagis/nominatim:4.4
-    ports:
-      - "127.0.0.1:8080:8080"
-    environment:
-      PBF_URL: "https://download.geofabrik.de/north-america/canada/british-columbia-latest.osm.pbf"
-      REPLICATION_URL: "https://download.geofabrik.de/north-america/canada/british-columbia-updates/"
-      NOMINATIM_PASSWORD: "change-me"
-    volumes:
-      - nominatim-data:/var/lib/postgresql/14/main
-      - nominatim-pbf:/nominatim-pbf
-    shm_size: 1gb
-    restart: unless-stopped
-
-  # ── Photon (fuzzy typeahead) ─────────────────────────────
+  # ── Photon (fuzzy geocoder) ──────────────────────────────
   # Community image (not official Komoot). Downloads a prebuilt
   # regional index on first boot — allow time and disk.
   # API: GET http://photon:2322/api?q=Oppen&limit=5
   # Response includes osm_type / osm_id + structured fields,
-  # which is exactly what Nominatim /lookup needs.
+  # which is what the eventual Nominatim /lookup step will consume.
   photon:
     image: rtuszik/photon-docker:latest
     ports:
@@ -100,6 +90,6 @@ services:
 
 volumes:
   navigator-data:
-  nominatim-data:
-  nominatim-pbf:
   photon-data:
+  sanitizer-rapidocr-cache:
+  sanitizer-docling-cache:
