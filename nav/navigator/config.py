@@ -7,6 +7,9 @@ class Settings(BaseSettings):
     # Private Nominatim instance (used for address → lat/lng).
     nominatim_endpoint: str = "http://127.0.0.1:8080"
 
+    # Private Photon instance (used for address → lat/lng).
+    photon_endpoint: str = "http://127.0.0.1:2322"
+
     session_purge_interval_s: int = 30
 
     # ── interview upload / sanitizer proxy ──────────────────

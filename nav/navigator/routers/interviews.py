@@ -252,42 +252,62 @@ async def set_location(
             or payload.postal_code
         )
     else:
-        # Free-text fallback (Enter without a candidate). Geocode and
-        # derive the short label ourselves.
-        endpoint = cfg.nominatim_endpoint.rstrip("/")
+        # Free-text fallback (Enter without a candidate). Photon handles
+        # typos; its response is GeoJSON with flat property fields, so we
+        # build the display label inline instead of using short_display().
+        endpoint = cfg.photon_endpoint.rstrip("/")
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.get(
-                    f"{endpoint}/search",
-                    params={
-                        "q": payload.postal_code,
-                        "format": "jsonv2",
-                        "limit": 1,
-                        "addressdetails": 1,
-                        "accept-language": "en",
-                    },
+                    f"{endpoint}/api",
+                    params={"q": payload.postal_code, "limit": 1, "lang": "en"},
                 )
         except httpx.RequestError as e:
-            raise HTTPException(502, f"geocoder unreachable: {e}")
+            raise HTTPException(502, f"photon unreachable: {e}")
         if r.status_code >= 400:
-            raise HTTPException(502, f"geocoder returned {r.status_code}")
-        results = r.json()
-        if not results:
-            raise HTTPException(
-                404, f"no match for postal code {payload.postal_code!r}"
-            )
-        top = results[0]
-        try:
-            lat = Decimal(str(top["lat"]))
-            lng = Decimal(str(top["lon"]))
-        except (KeyError, TypeError, ValueError):
-            raise HTTPException(502, "geocoder returned malformed result")
-        display_name = short_display(
-            top.get("address"),
-            top.get("display_name") or payload.postal_code,
-            query=payload.postal_code, 
-        )
+            raise HTTPException(502, f"photon returned {r.status_code}")
 
+        try:
+            data = r.json()
+        except ValueError as e:
+            raise HTTPException(502, f"photon returned non-JSON: {e}")
+
+        features = data.get("features") or []
+        if not features:
+            raise HTTPException(404, f"no match for {payload.postal_code!r}")
+
+        feat = features[0]
+        props = feat.get("properties") or {}
+        coords = (feat.get("geometry") or {}).get("coordinates") or []
+        if len(coords) < 2:
+            raise HTTPException(502, "photon returned malformed geometry")
+        try:
+            lon_f, lat_f = float(coords[0]), float(coords[1])
+        except (TypeError, ValueError):
+            raise HTTPException(502, "photon returned malformed coordinates")
+
+        name        = props.get("name")
+        street      = props.get("street")
+        housenumber = props.get("housenumber")
+        city        = props.get("city")
+        postcode    = props.get("postcode")
+
+        # short label: prefer "number street", else name, else street; + city
+        short_parts: list[str] = []
+        if housenumber and street:
+            short_parts.append(f"{housenumber} {street}")
+        elif name:
+            short_parts.append(name)
+        elif street:
+            short_parts.append(street)
+        if city:
+            short_parts.append(city)
+        display_name = ", ".join(short_parts) or payload.postal_code
+
+        lat = Decimal(str(lat_f))
+        lng = Decimal(str(lon_f))
+
+    
     sess.postal_code = payload.postal_code.strip()
     sess.origin_lat = lat
     sess.origin_lng = lng

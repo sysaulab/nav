@@ -17,23 +17,23 @@ export default function Welcome() {
             &nbsp;
           </h1>
           <p className="mt-3 text-slate-600">
-            Talk through your situation, upload supporting documents, and get a
-            personalized plan — or manage the local resource directory.
+            Talk through your situation, upload documents, and get a
+            personalized plan.
           </p>
         </header>
 
         <div className="grid gap-6 md:grid-cols-2">
           <Card
             to="/interview"
-            title="Help a customer"
+            title="Get Help!"
             badge="Ready"
             description="Guided conversation, document upload, and a personalized plan. One session at a time; everything is wiped when the session ends."
           />
           <Card
             to="/database"
-            title="Manage resources"
+            title="Directory"
             badge="Ready"
-            description="Browse and edit the HSDS directory. Set geographic coordinates so services can be fenced by bbox or radius."
+            description="Browse and edit the local directory."
           />
         </div>
 

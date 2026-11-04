@@ -7,7 +7,7 @@ import urllib.request
 from datetime import datetime, timezone
 import logging
 
-from .geocode import short_display 
+# from .geocode import short_display 
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
@@ -137,76 +137,167 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/health/geocoder")
     async def health_geocoder():
-        endpoint = settings.nominatim_endpoint.rstrip("/")
+        endpoint = settings.photon_endpoint.rstrip("/")
+        # Probe the real search endpoint, not the server root — a root "/"
+        # can return 200 while the index is still warming up, giving a
+        # green pill on a broken geocoder. A tiny real query exercises
+        # the index and the JSON pipeline.
+        probe_url = f"{endpoint}/api?q=a&limit=1"
         try:
-            code, _ = await _http_get(f"{endpoint}/", timeout=2.0)
-            return {"ok": True, "status_code": code, "endpoint": endpoint}
+            code, _ = await _http_get(probe_url, timeout=3.0)
+            return {
+                "ok": 200 <= code < 300,
+                "status_code": code,
+                "endpoint": endpoint,
+            }
         except Exception as e:
             return {"ok": False, "endpoint": endpoint, "error": str(e)}
 
+        
     @app.get("/api/geocode")
     async def geocode(
         q: str = Query(..., min_length=1, description="Free-form address"),
     ):
-        endpoint = settings.nominatim_endpoint.rstrip("/")
-        params = urllib.parse.urlencode({"q": q, "format": "json", "limit": 1})
+        endpoint = settings.photon_endpoint.rstrip("/")
+        params = urllib.parse.urlencode({"q": q, "limit": 1, "lang": "en"})
         try:
-            code, body = await _http_get(f"{endpoint}/search?{params}", timeout=5.0)
+            code, body = await _http_get(f"{endpoint}/api?{params}", timeout=5.0)
         except Exception as e:
-            raise HTTPException(502, f"geocoder unreachable: {e}")
+            raise HTTPException(502, f"photon unreachable: {e}")
         if code >= 400:
-            raise HTTPException(502, f"geocoder returned {code}")
-        results = json.loads(body)
-        if not results:
-            return None
-        top = results[0]
-        return {
-            "lat": float(top["lat"]),
-            "lng": float(top["lon"]),
-            "display_name": top.get("display_name"),
-        }
+            raise HTTPException(502, f"photon returned {code}")
 
+        try:
+            data = json.loads(body)
+        except ValueError as e:
+            raise HTTPException(502, f"photon returned non-JSON: {e}")
+
+        features = data.get("features") or []
+        if not features:
+            return None
+
+        feat = features[0]
+        props = feat.get("properties") or {}
+        coords = (feat.get("geometry") or {}).get("coordinates") or []
+        if len(coords) < 2:
+            return None
+        try:
+            lon = float(coords[0])
+            lat = float(coords[1])
+        except (TypeError, ValueError):
+            return None
+
+        # Photon has no `display_name` — build one from flat fields.
+        # Order matches what Nominatim would have returned closely enough
+        # for the "Matched: …" note in Database.tsx.
+        parts: list[str] = []
+        if props.get("name"):
+            parts.append(props["name"])
+        if props.get("street"):
+            hn = props.get("housenumber")
+            parts.append(f"{hn} {props['street']}".strip() if hn else props["street"])
+        if props.get("city"):
+            parts.append(props["city"])
+        if props.get("state"):
+            parts.append(props["state"])
+        if props.get("country"):
+            parts.append(props["country"])
+        display_name = ", ".join(parts) or q
+
+        return {"lat": lat, "lng": lon, "display_name": display_name}
+
+    
     @app.get("/api/geocode/search")
     async def geocode_search(
-        q: str = Query(..., min_length=2, description="Address or postal code"),
+        q: str = Query(..., min_length=2, description="Address, place, or postal code"),
         limit: int = Query(5, ge=1, le=10),
     ):
-        """Autocomplete candidates. Each result carries a compact
-        `short_display_name` alongside the full Nominatim display string."""
-        endpoint = settings.nominatim_endpoint.rstrip("/")
-        params = urllib.parse.urlencode(
-            {
-                "q": q,
-                "format": "json",
-                "limit": limit,
-                "addressdetails": 1,
-            }
-        )
+        """Fuzzy autocomplete via Photon.
+
+        Response shape matches GeocodeSuggestion in nav-ui/src/types.ts
+        exactly, so LocationGate and any other caller are unchanged.
+        """
+        endpoint = settings.photon_endpoint.rstrip("/")
+        params = urllib.parse.urlencode({"q": q, "limit": limit, "lang": "en"})
         try:
-            code, body = await _http_get(f"{endpoint}/search?{params}", timeout=5.0)
+            code, body = await _http_get(f"{endpoint}/api?{params}", timeout=4.0)
         except Exception as e:
-            raise HTTPException(502, f"geocoder unreachable: {e}")
+            raise HTTPException(502, f"photon unreachable: {e}")
         if code >= 400:
-            raise HTTPException(502, f"geocoder returned {code}")
-        results = json.loads(body)
+            raise HTTPException(502, f"photon returned {code}")
+
+        try:
+            data = json.loads(body)
+        except ValueError as e:
+            raise HTTPException(502, f"photon returned non-JSON: {e}")
+
         out: list[dict] = []
-        for r in results:
-            addr = r.get("address") or {}
-            full = r.get("display_name") or ""
-            out.append(
-                {
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lon"]),
-                    "display_name": full,
-                    "short_display_name": short_display(addr, full),
-                    "postcode": addr.get("postcode"),
-                    "city": addr.get("city")
-                    or addr.get("town")
-                    or addr.get("village"),
-                }
+        for feat in data.get("features", [])[:limit]:
+            props = feat.get("properties") or {}
+            coords = (feat.get("geometry") or {}).get("coordinates") or []
+            if len(coords) < 2:
+                continue
+            try:
+                lon, lat = float(coords[0]), float(coords[1])
+            except (TypeError, ValueError):
+                continue
+
+            name        = props.get("name")
+            street      = props.get("street")
+            housenumber = props.get("housenumber")
+            city        = props.get("city")
+            postcode    = props.get("postcode")
+            state       = props.get("state")
+            country     = props.get("country")
+
+            street_full = (
+                f"{housenumber} {street}".strip()
+                if housenumber and street else street
             )
-        return out
-    
+
+            # ── short label: what fits on one line in the dropdown ──
+            short_parts: list[str] = []
+            if name:
+                short_parts.append(name)
+            elif street_full:
+                short_parts.append(street_full)
+            elif postcode:
+                short_parts.append(postcode)
+            if city and city not in short_parts:
+                short_parts.append(city)
+            short_display_name = ", ".join(short_parts) or q
+
+            # ── full label: everything, in address order, deduped ──
+            full_parts: list[str] = []
+            if name and name not in (street_full, city):
+                full_parts.append(name)
+            if street_full:
+                full_parts.append(street_full)
+            if city:
+                full_parts.append(city)
+            if postcode:
+                full_parts.append(postcode)
+            if state:
+                full_parts.append(state)
+            if country:
+                full_parts.append(country)
+
+            seen: list[str] = []
+            for p in full_parts:
+                if not seen or seen[-1] != p:
+                    seen.append(p)
+            display_name = ", ".join(seen) or short_display_name
+
+            out.append({
+                "lat": lat,
+                "lng": lon,
+                "display_name": display_name,
+                "short_display_name": short_display_name[:120],
+                "postcode": postcode,
+                "city": city,
+            })
+
+        return out    
 # Remove the early duplicate entirely.
 
     @app.get("/api/health")

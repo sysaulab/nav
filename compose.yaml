@@ -32,6 +32,7 @@ services:
       NAVIGATOR_DATABASE_URL: "sqlite+aiosqlite:////data/navigator.db"
       NAVIGATOR_SANITIZER_ENDPOINT: "http://sanitizer:8000/ingest"
       NAVIGATOR_NOMINATIM_ENDPOINT: "http://nominatim-bc:8080"
+      NAVIGATOR_PHOTON_ENDPOINT: "http://photon:2322"
 
       # ── External Ollama ──────────────────────────────────
       # Point this at the host machine (or wherever your Ollama is
@@ -46,9 +47,11 @@ services:
       NAVIGATOR_FINAL_MODEL: "nemotron-3-ultra:cloud"
 
     depends_on:
-      sanitizer: 
+      sanitizer:
         condition: service_started
       nominatim-bc:
+        condition: service_started
+      photon:
         condition: service_started
     restart: unless-stopped
 
@@ -67,6 +70,29 @@ services:
     shm_size: 1gb
     restart: unless-stopped
 
+  # ── Photon (fuzzy typeahead) ─────────────────────────────
+  # Community image (not official Komoot). Downloads a prebuilt
+  # regional index on first boot — allow time and disk.
+  # API: GET http://photon:2322/api?q=Oppen&limit=5
+  # Response includes osm_type / osm_id + structured fields,
+  # which is exactly what Nominatim /lookup needs.
+  photon:
+    image: rtuszik/photon-docker:latest
+    ports:
+      - "127.0.0.1:2322:2322"
+    environment:
+      # Prebuilt region: country code, continent, or "planet".
+      # "canada" is far smaller than the ~60GB planet index.
+      # If "canada" isn't offered in the current release, use
+      # "north-america".
+      REGION: "canada"
+      # Don't auto-refresh the index behind our back; we control
+      # when the index is rebuilt.
+      UPDATE_STRATEGY: "DISABLED"
+    volumes:
+      - photon-data:/photon/data
+    restart: unless-stopped
+
   nav-ui:
     build: ./nav-ui
     ports: ["80:80"]
@@ -76,3 +102,4 @@ volumes:
   navigator-data:
   nominatim-data:
   nominatim-pbf:
+  photon-data:

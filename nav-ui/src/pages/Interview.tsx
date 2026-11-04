@@ -12,11 +12,14 @@ import type {
 import FileDropzone from '../components/FileDropzone'
 import { matchesAccept } from '../util/files.tsx'
 import * as React from 'react'
+import { usePrivacy } from '../privacy/PrivacyContext'
+
 
 type Upload = { id: string; filename: string; pct: number }
 
 export default function Interview() {
   const navigate = useNavigate()
+  const { clearPin } = usePrivacy()
   const [session, setSession] = useState<InterviewSession | null>(null)
   const [docs, setDocs] = useState<DocumentMeta[]>([])
   const [context, setContext] = useState<ContextPrompt | null>(null)
@@ -142,6 +145,7 @@ async function onFiles(files: File[]) {
     if (!confirm('End this session? Documents and chat history will be discarded.')) return
     try {
       await api.interviews.end(session.id)
+      clearPin()
       setSession(null)
       setDocs([])
       setContext(null)
