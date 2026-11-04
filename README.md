@@ -7,8 +7,8 @@ Two services that help a caseworker connect a client to local services. The **sa
 browser ──► nav-ui (nginx :80) ──► nav (FastAPI :8001) ──► SQLite (nav.db)
                                         │
                                         ├──► sanitizer (FastAPI :8000)  ← document uploads
-                                        ├──► Nominatim                   ← address → lat/lng
-                                        └──► Ollama                      ← chat + finalize
+                                        ├──► photon (:2322)             ← address → lat/lng
+                                        └──► Ollama                     ← chat + finalize
 ```
 
 The sanitizer is stateless — no sessions, no cookies, no LLM. The navigator is stateful — it owns the directory DB, sessions, and uploaded-document metadata.
@@ -20,13 +20,18 @@ The sanitizer is stateless — no sessions, no cookies, no LLM. The navigator is
 On the host:
 
 - **Docker Engine + Compose v2.**
-- **Ollama** running on the host, reachable at `host.docker.internal:11434`. Pull two models:
+- **Ollama** running on the host, reachable at `host.docker.internal:11434`. Pull the models the running stack will actually ask for:
   ```bash
-  ollama pull gemma4:cloud      # chat model
-  ollama pull beam:cloud        # final-plan model
+  # Under `docker compose up`: chat=gemma4:cloud, finalize=nemotron-3-ultra:cloud
+  ollama pull gemma4:cloud
+  ollama pull nemotron-3-ultra:cloud
+
+  # If you run the navigator standalone (no compose), the finalize model
+  # defaults to `beam:cloud` — pull that instead:
+  # ollama pull beam:cloud
   ```
-  Swap these for any others by setting `OLLAMA_MODEL` / `FINAL_MODEL` in `.env` (see Configuration below) — assuming `compose.yaml` reads them.
-- **A Nominatim instance.** `compose.yaml` presumably defines one (`nominatim-bc`) and the navigator's default `NOMINATIM_ENDPOINT` matches. If not, point `NAVIGATOR_NOMINATIM_ENDPOINT` at any Nominatim-compatible URL — the public one works but rate-limits hard.
+  Override with `NAVIGATOR_OLLAMA_MODEL` / `NAVIGATOR_FINAL_MODEL`. Note that `compose.yaml` already overrides the finalize model to `nemotron-3-ultra:cloud`, so if you're running under compose you only need the first two.
+- **A Photon instance.** `compose.yaml` includes one (`rtuszik/photon-docker` with a prebuilt Canada index on first boot — allow time and disk; the planet index is ~60 GB, "canada" is far smaller). If you're bringing your own, point `NAVIGATOR_PHOTON_ENDPOINT` at it. **Nominatim is not part of the pilot stack** — `NAVIGATOR_NOMINATIM_ENDPOINT` exists as a setting but is only echoed in `/api/health`; the actual geocoder is Photon.
 - **~4 GB RAM** on first ingest, for the sanitizer's OCR + docling model caches. Steady-state is much lower.
 
 No host Python, no host Node, no host pandoc.
@@ -42,7 +47,7 @@ docker compose up --build -d
 
 First build takes several minutes:
 
-- `sanitizer` installs CPU-only torch, then warms RapidOCR + Docling model caches into `/opt/models` (a few hundred MB).
+- `sanitizer` installs CPU-only torch, then warms RapidOCR + Docling model caches into `/opt/models` (a few hundred MB). **Note:** `compose.yaml` currently mounts the sanitizer's cache volumes at `/home/app/.cache/{rapidocr,docling}`, not `/opt/models` — see [Known issues in the current tree](#known-issues-in-the-current-tree). The image still works; the caches just won't survive a rebuild until the mount paths are aligned.
 - `nav-ui` runs a Vite build, then copies `dist/` into nginx.
 - `nav` is a small install.
 
@@ -53,7 +58,7 @@ docker compose ps                       # all services "running"
 docker compose logs -f nav              # follow the navigator
 ```
 
-Open **`http://localhost:8080`** — that's the UI. The status pills at the bottom of the welcome page should turn green for `nav`, `doc`, `geo`, and `llm`. A pill that stays red names the endpoint it failed to reach; that's the fastest way to spot a mis-set environment variable.
+Open **`http://localhost`** (the UI is published on port 80) — that's the UI. The status pills at the bottom of the welcome page should turn green for `nav`, `doc`, `geo`, and `llm`. A pill that stays red names the endpoint it failed to reach; that's the fastest way to spot a mis-set environment variable.
 
 ---
 
@@ -63,8 +68,8 @@ Open **`http://localhost:8080`** — that's the UI. The status pills at the bott
 2. **`/interview`.** You should land on the location gate ("Where are you located?"). Type a postal code — the autocomplete should populate from `geo`. Pick one.
 3. **Upload a PDF.** Any small one. It should appear in the Documents panel with a token count, and the "context budget" bar should move.
 4. **Send a chat turn.** The assistant should respond. If it hangs, `llm` is unreachable or the model name is wrong.
-5. **Finish.** The plan renders in the green box; "Download .docx" produces a valid file (exercises the pandoc subprocess).
-6. **Close the tab, reopen.** A fresh session is created; the previous one is orphaned and will be swept in ~15 min by the purge loop.
+5. **Finish.** The plan renders in the green box; **"📄 Office"** produces a valid `.docx` (exercises the pandoc subprocess). "📄 Markdown" downloads the raw plan.
+6. **Close the tab, reopen.** The same session is resumed from the `nav_session` cookie, provided the row is still `active` and hasn't crossed its `expires_at` deadline. A fresh session is only minted if the cookie is missing or the row is gone/expired. To force a fresh session, wait out the 15-minute idle TTL or clear the cookie; the purger sweeps orphaned rows in ~15 min.
 
 If all six pass, you have a working install. If any fail, the failure names the layer.
 
@@ -90,9 +95,17 @@ python3.11 -m venv .venv && . .venv/bin/activate
 sudo apt-get install -y pandoc                                   # for DOCX export
 pip install -e .
 NAVIGATOR_SANITIZER_ENDPOINT=http://127.0.0.1:8000/ingest \
-NAVIGATOR_NOMINATIM_ENDPOINT=http://127.0.0.1:8080 \
+NAVIGATOR_PHOTON_ENDPOINT=http://127.0.0.1:2322 \
 NAVIGATOR_OLLAMA_ENDPOINT=http://127.0.0.1:11434 \
 python -m navigator --host 127.0.0.1 --port 8001
+```
+
+**Photon** (port 2322, if you're not using the compose stack):
+```bash
+docker run -d --name photon -p 2322:2322 \
+    -e REGION=canada -e UPDATE_STRATEGY=DISABLED \
+    -v photon-data:/photon/data \
+    rtuszik/photon-docker:latest
 ```
 
 **UI** (port 5173, hot reload):
@@ -144,7 +157,7 @@ Nothing is global except the service directory itself.
 
 The navigator handles many sessions concurrently in **one event loop, one process**. `uvicorn.run(create_app(...), ...)` in `nav/navigator/main.py` passes no `workers` argument, so it defaults to 1. Concurrency comes from asyncio, not from multiple processes.
 
-That's the correct shape for this workload: almost everything blocking lives off-process — SQLite via aiosqlite, the sanitizer via httpx, Nominatim via httpx, Ollama via httpx, pandoc via `asyncio.create_subprocess_exec`. The event loop stays responsive because no handler holds the GIL for long.
+That's the correct shape for this workload: almost everything blocking lives off-process — SQLite via aiosqlite, the sanitizer via httpx, Photon via httpx, Ollama via httpx, pandoc via `asyncio.create_subprocess_exec`. The event loop stays responsive because no handler holds the GIL for long.
 
 Three intentional serialization points:
 
@@ -173,7 +186,7 @@ Three intentional serialization points:
 
 1. Browser loads `/`, sees status pills populated from `/api/health*` — each pill reports the actual endpoint the backend dialed.
 2. Opens `/interview`. `POST /interviews` creates a session and sets the cookie.
-3. Location gate: debounced autocomplete against `/api/geocode/search`; the chosen candidate is posted to `/interviews/{sid}/location`, which geocodes (or trusts the candidate), builds the nearby-services index, and resets `revealed_service_indices`.
+3. Location gate: debounced autocomplete against `/api/geocode/search` (Photon); the chosen candidate is posted to `/interviews/{sid}/location`, which geocodes (or trusts the candidate), builds the nearby-services index, and resets `revealed_service_indices`.
 4. Uploads: multipart POST to `/interviews/{sid}/documents`, forwarded to the sanitizer, filtered, token-estimated, stored. Per-document status (`ready`, `skipped_too_large`, `quarantine`) is surfaced in the UI alongside a live token-budget bar.
 5. Chat: `POST /interviews/{sid}/chat` streams NDJSON from Ollama with a `get_service_details(index)` tool. Tool results stay server-side; expanded services are also promoted into the next turn's system prompt so the model doesn't re-request them.
 6. Finalize: `POST /interviews/{sid}/finalize` reuses the same context assembly against a different base prompt and a different model. The plan streams back the same way.
@@ -193,14 +206,28 @@ Navigator defaults worth knowing:
 |---|---|---|
 | `NAVIGATOR_DATABASE_URL` | `sqlite+aiosqlite:///./navigator.db` | SQLite via aiosqlite |
 | `NAVIGATOR_SANITIZER_ENDPOINT` | `http://127.0.0.1:8000/ingest` | Sanitizer POST target |
-| `NAVIGATOR_NOMINATIM_ENDPOINT` | `http://127.0.0.1:8080` | Geocoder base URL |
+| `NAVIGATOR_SANITIZER_TIMEOUT_S` | `600` | Per-upload timeout |
+| `NAVIGATOR_PHOTON_ENDPOINT` | `http://127.0.0.1:2322` | Geocoder base URL |
 | `NAVIGATOR_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | Ollama base URL |
+| `NAVIGATOR_OLLAMA_MODEL` | `gemma4:cloud` | Chat model |
+| `NAVIGATOR_OLLAMA_TIMEOUT_S` | `600` | Per-chat-turn timeout |
+| `NAVIGATOR_FINAL_MODEL` | `beam:cloud` | Finalize model. **Overridden to `nemotron-3-ultra:cloud` by `compose.yaml`** |
+| `NAVIGATOR_FINAL_TIMEOUT_S` | `600` | Finalize timeout |
 | `NAVIGATOR_SESSION_IDLE_MINUTES` | `15` | Sliding TTL per session |
 | `NAVIGATOR_SESSION_PURGE_INTERVAL_S` | `30` | Background sweep cadence |
 | `NAVIGATOR_MAX_DOCUMENTS_PER_SESSION` | `50` | Per-session upload cap |
 | `NAVIGATOR_DOCUMENT_BUDGET_TOKENS` | `220_000` | Prompt budget per chat turn |
 | `NAVIGATOR_POSTCODE_RADIUS_KM` | `25.0` | Nearby-services radius |
-| `NAVIGATOR_NEARBY_FULL_LIMIT` | `5` | How many services render in full by default |
+| `NAVIGATOR_NEARBY_LOCATION_LIMIT` | `20` | Locations listed in the system prompt |
+| `NAVIGATOR_NEARBY_INDEX_LIMIT` | `100` | Total services in the per-session index |
+| `NAVIGATOR_TOKENIZER_MODEL` | `google/gemma-2-2b-it` | Tokenizer used for prompt-budget estimation. Falls back to `chars/3.5` if `transformers` is missing or the model isn't cached |
+
+Vestigial / unused settings — present in `config.py` but not consulted on the hot path:
+
+| Setting | Notes |
+|---|---|
+| `NAVIGATOR_NOMINATIM_ENDPOINT` | No longer used for geocoding. `/api/health` still echoes it in the payload, but nothing dials it. Photon is the geocoder. |
+| `NAVIGATOR_POSTCODE_RADIUS_DEG` | Defined but unused; `_nearby_services` and `_build_chat_context` read `postcode_radius_km` only. |
 
 Sanitizer defaults (see `sanitizer/README.md`): `SANITIZER_MAX_UPLOAD_BYTES = 100 MiB`, `SANITIZER_MAX_PAGES = 500`, `SANITIZER_LOW_CONFIDENCE_THRESHOLD = 0.65`. All safety valves, not functional constraints.
 
@@ -217,6 +244,18 @@ Sanitizer defaults (see `sanitizer/README.md`): `SANITIZER_MAX_UPLOAD_BYTES = 10
 
 ---
 
+## Known issues in the current tree
+
+These are known defects in `compose.yaml`, the Dockerfiles, and a couple of stray references — none block a working install, but they will bite under specific conditions. Worth fixing rather than documenting around; listed here so anyone triaging a failure knows where to look.
+
+- **`nav/dockerfile` HEALTHCHECK dials the wrong host.** The CMD is `curl -sf http://host.docker.internal:8001/api/health`. From *inside* the `nav` container, `host.docker.internal` points at the Docker host, not the container itself — so the healthcheck will report unhealthy even when the app is fine. Should be `http://127.0.0.1:8001/api/health`.
+- **`nav/dockerfile` sets a dead `NAVIGATOR_NOMINATIM_ENDPOINT`.** It bakes in `NAVIGATOR_NOMINATIM_ENDPOINT="http://nominatim-bc:8080"`, but `nominatim-bc` is not a service in `compose.yaml`. Under `docker compose up` this is harmless (compose overrides it via env), but anyone running the Dockerfile standalone will see `/api/health` report a phantom Nominatim, and if they also forget to set `NAVIGATOR_PHOTON_ENDPOINT`, geocoding silently falls back to the in-container default `http://127.0.0.1:2322` — which is the container's own loopback, not the host's Photon.
+- **`compose.yaml` mounts sanitizer caches at the wrong path.** The sanitizer image warms RapidOCR and Docling model caches into `/opt/models` (`XDG_CACHE_HOME` / `HF_HOME`), but `compose.yaml` mounts `sanitizer-rapidocr-cache` at `/home/app/.cache/rapidocr` and `sanitizer-docling-cache` at `/home/app/.cache/docling`. Nothing is written to either volume, so a rebuild re-downloads several hundred MB of model weights. Fix is to remount at `/opt/models` (or split per-library cache dirs and align the Dockerfile).
+- **`/api/health` echoes a dead geocoder field.** `nav/navigator/main.py` returns `"geocoder": settings.nominatim_endpoint` in the `/api/health` payload. That field is cosmetic (the UI derives pill text from `window.location.host` and `/api/health/geocoder`), but it's the last remaining reference to Nominatim and will mislead anyone reading a raw `/api/health` response. Rename or drop.
+- **`postcode_radius_deg` is dead code.** `nav/navigator/config.py` defines `postcode_radius_deg: float = 0.5`, but no code reads it — `_nearby_services` and `_build_chat_context` compute the SQL bbox from `postcode_radius_km / 111.0`. Safe to delete, or to repurpose if a future caller wants the raw padding.
+
+---
+
 ## Where things live
 
 ```
@@ -226,6 +265,9 @@ nav/           navigator FastAPI backend
 nav-ui/        React front end (Vite + Tailwind)
 ```
 
+The Photon service (`rtuszik/photon-docker:latest`) is defined in `compose.yaml` and its index lives in the `photon-data` volume. It is the only geocoder — Nominatim is not part of the stack.
+
 The sanitizer container should be built with `--secret id=hf_token` only if `INSTALL_TOKENIZER=1` — the tokenizer is not needed for correctness, only for tight prompt budgets.
 
 The navigator's SQLite file lives at `/data/navigator.db` in the container (`NAVIGATOR_DATABASE_URL`). It is the only durable state in the whole system — back it up, or accept that the directory is disposable.
+

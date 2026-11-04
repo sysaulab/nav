@@ -5,12 +5,15 @@ officemd==0.1.8
 
 # docling 2.113.0 is the current stable; floor must include [opendocument]
 # so odfdo is pulled in as a transitive dependency.
-docling[opendocument]==2.113.0
+docling[format-opendocument]==2.113.0
 pymupdf==1.28.2
+
+
 
 # --- PDF text-layer detection ---------------------------------------------
 # pypdf 6.x includes security hardening; 4.x is too old.
 pypdf==6.0.0
+
 
 # --- MIME sniffing (optional) ---------------------------------------------
 # 0.4.27 is the only current release; cap below 0.5 for safety.
