@@ -80,7 +80,7 @@ export default function Interview() {
 
   // ── upload ────────────────────────────────────────────
 const ACCEPT =
-  '.rtf,.pdf,.txt,.md,.docx,.odt,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
+  '.rtf,.pdf,.txt,.md,.docx,.odt,.ods,.odp,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
 
 const BLOCKED_LEGACY: Record<string, string> = {
   '.doc': '.docx',

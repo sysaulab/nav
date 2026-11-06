@@ -322,7 +322,31 @@ def create_app(settings: Settings) -> FastAPI:
             })
 
         return out    
-# Remove the early duplicate entirely.
+
+
+    @app.get("/api/health/sql")
+    async def health_sql():
+        """Probe the database with a trivial SELECT 1.
+
+        Reports the backend name (postgresql / sqlite) so the SQL pill
+        can show which engine is in play. Uses the same async engine the
+        pipeline uses, so a healthy signal here means the routes will
+        actually be able to talk to the DB.
+
+        SELECT 1 rather than the advisory-lock probe used by the purge
+        loop: advisory locks serialize against in-flight ingest, which
+        would make the health check lie under load.
+        """
+        engine = get_engine()
+        backend = engine.url.get_backend_name()
+        try:
+            async with get_sessionmaker()() as db:
+                await db.execute(text("SELECT 1"))
+            return {"ok": True, "backend": backend}
+        except Exception as e:
+            return {"ok": False, "backend": backend, "error": str(e)}
+
+
 
     @app.get("/api/health")
     async def health():

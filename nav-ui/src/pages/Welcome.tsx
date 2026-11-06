@@ -50,14 +50,7 @@ function SystemStatus() {
   const [ingest, setIngest] = useState<HealthState>('loading')
   const [geocoder, setGeocoder] = useState<HealthState>('loading')
   const [ollama, setOllama] = useState<HealthState>('loading')
-
-  // Endpoints as reported by the backend. The pills display what maestro
-  // actually dialed — not a hardcoded string — so a wrong env var shows up
-  // as the wrong hostname instead of hiding behind a generic red dot.
-  const [ingestEndpoint, setIngestEndpoint] = useState<string | null>(null)
-  const [geocoderEndpoint, setGeocoderEndpoint] = useState<string | null>(null)
-  const [ollamaEndpoint, setOllamaEndpoint] = useState<string | null>(null)
-  const [ollamaModel, setOllamaModel] = useState<string | null>(null)
+  const [sql, setSql] = useState<HealthState>('loading')
 
   useEffect(() => {
     let alive = true
@@ -75,7 +68,6 @@ function SystemStatus() {
       .then((d) => {
         if (!alive) return
         setIngest(d.ok ? 'ok' : 'down')
-        if (typeof d.endpoint === 'string') setIngestEndpoint(d.endpoint)
       })
       .catch(() => alive && setIngest('down'))
 
@@ -84,7 +76,6 @@ function SystemStatus() {
       .then((d) => {
         if (!alive) return
         setGeocoder(d.ok ? 'ok' : 'down')
-        if (typeof d.endpoint === 'string') setGeocoderEndpoint(d.endpoint)
       })
       .catch(() => alive && setGeocoder('down'))
 
@@ -93,49 +84,29 @@ function SystemStatus() {
       .then((d) => {
         if (!alive) return
         setOllama(d.ok ? 'ok' : 'down')
-        if (typeof d.endpoint === 'string') setOllamaEndpoint(d.endpoint)
-        if (typeof d.model === 'string') setOllamaModel(d.model)
       })
       .catch(() => alive && setOllama('down'))
+
+    fetch('/api/health/sql')
+      .then((r) => r.json())
+      .then((d) => {
+        if (!alive) return
+        setSql(d.ok ? 'ok' : 'down')
+      })
+      .catch(() => alive && setSql('down'))
 
     return () => { alive = false }
   }, [])
 
-  const llmDetail = ollamaEndpoint
-    ? ollamaModel
-      ? `${shortenEndpoint(ollamaEndpoint)} · ${ollamaModel}`
-      : shortenEndpoint(ollamaEndpoint)
-    : 'loading…'
-
   return (
     <div className="mt-10 flex flex-wrap items-center justify-center gap-2">
-      {/* Maestro is reached via the nginx /api proxy on whatever origin the
-          browser loaded this page from — so the honest "endpoint" is our
-          own host, not the container's internal bind address. */}
-      <Pill
-        tone={toneFor(maestro)}
-        label="nav"
-        detail={window.location.host}
-      />
-      <Pill
-        tone={toneFor(ingest)}
-        label="doc"
-        detail={ingestEndpoint ? shortenEndpoint(ingestEndpoint) : 'loading…'}
-      />
-      <Pill
-        tone={toneFor(geocoder)}
-        label="geo"
-        detail={geocoderEndpoint ? shortenEndpoint(geocoderEndpoint) : 'loading…'}
-      />
-      <Pill tone={toneFor(ollama)} label="llm" detail={llmDetail} />
+      <Pill tone={toneFor(maestro)} label="nav" />
+      <Pill tone={toneFor(ingest)} label="doc" />
+      <Pill tone={toneFor(geocoder)} label="geo" />
+      <Pill tone={toneFor(ollama)} label="llm" />
+      <Pill tone={toneFor(sql)} label="sql" />
     </div>
   )
-}
-
-/** Strip scheme and a trailing slash for compact display.
- *  Keeps host:port and any path — both are diagnostic. */
-function shortenEndpoint(url: string): string {
-  return url.replace(/^https?:\/\//, '').replace(/\/$/, '')
 }
 
 function toneFor(state: HealthState): PillTone {

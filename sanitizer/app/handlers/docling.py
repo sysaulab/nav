@@ -12,11 +12,28 @@ from texts[].prov.page_no that are absent from the top-level pages list.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from app.handlers.quarantine import quarantine
 from app.models import Block, Document, Page, rollup
 from app.settings import MAX_PAGES
+
+
+# Module-level singleton. DocumentConverter.__init__ loads models and takes
+# seconds; constructing one per request pays that cost on every docling-
+# routed upload. Mirrors app.ocr.engine.OcrEngine's lazy pattern. Safe
+# under the sanitizer's single-worker, single-_ingest_lock design: no
+# locking needed, and a failed init leaves _converter as None so the next
+# request retries rather than caching the failure.
+_converter: Any = None
+
+
+def _get_converter() -> Any:
+    global _converter
+    if _converter is None:
+        from docling.document_converter import DocumentConverter
+        _converter = DocumentConverter()
+    return _converter
 
 
 def _map_docling_label(label: str) -> str:
@@ -98,18 +115,15 @@ def handle_docling(
     route_name: str = "docling_office",
 ) -> Document:
     try:
-        from docling.document_converter import DocumentConverter
+        converter = _get_converter()
+        result = converter.convert(str(path))
+        doc_dict = result.document.export_to_dict()
     except ImportError:
         return quarantine(
             doc_id, path, declared, sniffed,
             route=route_name, converter="docling",
             reason="docling_not_installed",
         )
-
-    try:
-        converter = DocumentConverter()
-        result = converter.convert(str(path))
-        doc_dict = result.document.export_to_dict()
     except Exception as e:
         return quarantine(
             doc_id, path, declared, sniffed,

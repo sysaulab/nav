@@ -3,9 +3,10 @@ router.py — file router for the document processing pipeline.
 
 Reads a file, sniffs its type, and dispatches it down the cheapest viable path:
 
-    office  -> officemd
-    pdf     -> native parser (stub) | scanned -> OCR (stub)
-    image   -> RapidOCR microservice at http://localhost:8000/ocr
+    soffice -> LibreOffice headless (ODF, legacy binary Office, RTF)
+    office  -> officemd (OOXML)
+    pdf     -> native parser | scanned -> OCR
+    image   -> RapidOCR
     text    -> read as-is
     other   -> quarantine
 
@@ -24,15 +25,13 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from app.handlers.docling import handle_docling
 from app.handlers.image import handle_image
 from app.handlers.office import handle_office
 from app.handlers.pdf import handle_pdf
 from app.handlers.quarantine import quarantine
+from app.handlers.soffice import handle_soffice
 from app.handlers.text import handle_text
 from app.models import Document
-
-from app.handlers.rtf import handle_rtf
 
 try:
     import magic  # python-magic; needs libmagic on the host
@@ -45,37 +44,28 @@ except ImportError:
 # --------------------------------------------------------------------------
 
 
-# Keep these with officemd (OOXML, handled without LibreOffice)
+# LibreOffice-handled formats: ODF, legacy binary Office, RTF.
+# Routed to `soffice --headless`, not docling. Replaces the old
+# BLOCKED_LEGACY_EXTS / DOCLING_EXTS split — we can now convert these
+# in-image without the LibreOffice-via-docling profile lock.
+SOFFICE_EXTS = {".odt", ".ods", ".odp", ".doc", ".xls", ".ppt", ".rtf"}
+SOFFICE_MIMES = {
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.oasis.opendocument.presentation",
+    "application/msword",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/rtf",
+    "text/rtf",
+}
+
+# OOXML — handled by officemd, no LibreOffice required.
 OFFICE_EXTS = {".docx", ".xlsx", ".pptx"}
-
-# Route these to Docling (ODF + legacy binary + RTF)
-DOCLING_EXTS = {".odt", ".ods", ".odp"}
-
 OFFICE_MIMES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-}
-
-DOCLING_MIMES = {
-    "application/vnd.oasis.opendocument.text",
-    "application/vnd.oasis.opendocument.spreadsheet",
-    "application/vnd.oasis.opendocument.presentation",
-}
-
-RTF_EXTS = {".rtf"}
-RTF_MIMES = {"application/rtf", "text/rtf"}
-
-
-# Classic Office 97-2003 binary formats (OLE2/CFB). Docling can only parse
-# these via LibreOffice headless (>=2.114) — a ~500 MB image dependency.
-# Reject up front with a "save as OOXML" hint rather than let Docling fail
-# with a generic "File format not allowed".
-BLOCKED_LEGACY_EXTS = {".doc", ".xls", ".ppt"}
-BLOCKED_LEGACY_MIMES = {
-    "application/msword",
-    "application/vnd.ms-excel",
-    "application/vnd.ms-powerpoint",
 }
 
 PDF_EXTS = {".pdf"}
@@ -120,22 +110,11 @@ def route(path: Path | str, *, display_name: str | None = None) -> Document:
     sniffed = sniff_mime(raw, path.name)
     ext = path.suffix.lower()
 
-    if ext in BLOCKED_LEGACY_EXTS or sniffed in BLOCKED_LEGACY_MIMES:
-        doc = quarantine(
-            doc_id, path, declared, sniffed,
-            route="blocked_legacy_office", converter="none",
-            reason=(
-                f"legacy_binary_office_unsupported: {ext or 'unknown'} is a "
-                f"classic Office 97-2003 binary format. Save the file as "
-                f"OOXML (.docx / .xlsx / .pptx) and re-upload."
-            ),
-        )
-    elif ext in RTF_EXTS or sniffed in RTF_MIMES:
-        doc = handle_rtf(path, raw, doc_id, declared, sniffed)
-    elif ext in DOCLING_EXTS or sniffed in DOCLING_MIMES:
-        doc = handle_docling(path, raw, doc_id, declared, sniffed,
-                             route_name="docling_office")
-    elif ext in OFFICE_EXTS or sniffed in OFFICE_MIMES or declared in OFFICE_MIMES:
+    if (ext in SOFFICE_EXTS or sniffed in SOFFICE_MIMES
+            or declared in SOFFICE_MIMES):
+        doc = handle_soffice(path, raw, doc_id, declared, sniffed)
+    elif (ext in OFFICE_EXTS or sniffed in OFFICE_MIMES
+            or declared in OFFICE_MIMES):
         doc = handle_office(path, raw, doc_id, declared, sniffed)
     elif ext in PDF_EXTS or sniffed in PDF_MIMES or declared in PDF_MIMES:
         doc = handle_pdf(path, raw, doc_id, declared, sniffed)
@@ -165,7 +144,7 @@ def route_bytes(filename: str, raw: bytes) -> Document:
     """Route an in-memory upload down the same path as `route()`.
 
     `route()` is path-based — it re-reads bytes for hashing and hands the
-    path to officemd / docling / pymupdf. So we spool `raw` to a temp file
+    path to officemd / soffice / pymupdf. So we spool `raw` to a temp file
     inside a TemporaryDirectory, preserving the original basename so
     extension-based MIME guessing inside `route()` matches what a real
     on-disk upload would produce. `display_name` carries the original

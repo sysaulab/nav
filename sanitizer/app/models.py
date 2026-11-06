@@ -98,6 +98,12 @@ def rollup(pages: list[Page]) -> dict:
     Blocks with `confidence["min"] < LOW_CONFIDENCE_THRESHOLD` are listed in
     `low_confidence_block_ids` but never dropped — filtering is the caller's
     decision.
+
+    A block is treated as "did not report confidence" (and skipped) unless
+    all three of `min`, `mean`, and `max` are present and non-None. A
+    partially-filled confidence dict is malformed input from a handler; the
+    alternative — trusting it — means a `TypeError` on `None < float` taking
+    down every ingest.
     """
     mins: list[float] = []
     means: list[float] = []
@@ -108,10 +114,15 @@ def rollup(pages: list[Page]) -> dict:
         for b in page.blocks:
             if not b.confidence:
                 continue
-            mins.append(b.confidence["min"])
-            means.append(b.confidence["mean"])
-            maxs.append(b.confidence["max"])
-            if b.confidence["min"] < LOW_CONFIDENCE_THRESHOLD and b.block_id:
+            min_conf = b.confidence.get("min")
+            mean_conf = b.confidence.get("mean")
+            max_conf = b.confidence.get("max")
+            if min_conf is None or mean_conf is None or max_conf is None:
+                continue
+            mins.append(min_conf)
+            means.append(mean_conf)
+            maxs.append(max_conf)
+            if min_conf < LOW_CONFIDENCE_THRESHOLD and b.block_id:
                 low_ids.append(b.block_id)
 
     conf: dict[str, Any] = (

@@ -51,6 +51,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from app.ocr.engine import ocr_engine
 from app.router import route_bytes
 from app.settings import MAX_UPLOAD_BYTES
 
@@ -181,6 +182,23 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def _warm_ocr_engine() -> None:
+    """Force-load RapidOCR models so /ready is honest about state.
+
+    OcrEngine.__init__ only sets self._engine = None; the actual ONNX
+    model load (~100 MB, several seconds) happens lazily on the first
+    recognize() call. Without this warm-up, /ready would return 200
+    while the first real ingest still paid model-load latency.
+
+    If the model fails to load, OcrEngineError propagates and uvicorn
+    fails startup — loud and searchable, better than serving 500s from
+    a "ready" service. The Dockerfile's HEALTHCHECK start-period (30s)
+    covers the warm-up window.
+    """
+    ocr_engine._get()
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -188,9 +206,10 @@ def health():
 
 @app.get("/ready")
 def ready():
-    # The OCR engine is a module-level singleton in app.ocr.engine. If this
-    # module imported successfully, the ONNX models are in memory. Docling is
-    # imported lazily inside its handler and is not checked here.
+    # OcrEngine is warmed at startup (_warm_ocr_engine above) so, if this
+    # endpoint is reachable, the ONNX models are actually in memory.
+    # Docling is imported lazily inside its handler and is not checked
+    # here — the first docling-routed upload pays model-load cost.
     return {"status": "ready", "ocr_engine": "loaded"}
 
 

@@ -15,8 +15,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # libgl1/libglib2.0-0: opencv-headless (rapidocr)
 # libgomp1: onnxruntime OpenMP runtime
 # libmagic1: python-magic
+# libreoffice-nogui + libreoffice-java-common: soffice conversion for
+#   ODF / legacy binary Office / RTF (replaces docling for these routes)
+# fonts-liberation: baseline metric-compatible fonts; without them,
+#   soffice substitutes and line breaks shift in every converted doc
+# pandoc: kept for the RTF route? No — soffice handles RTF. Remove pandoc.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 libglib2.0-0 libgomp1 libmagic1 pandoc \
+        libgl1 libglib2.0-0 libgomp1 libmagic1 \
+        libreoffice-nogui libreoffice-java-common \
+        fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -u 10001 -m -s /sbin/nologin app
