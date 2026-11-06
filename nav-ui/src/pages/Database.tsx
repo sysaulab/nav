@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
+import * as React from 'react'
 import { api } from '../api'
+import { AddressAutocomplete } from '../components/AddressAutocomplete'
 import type {
   Location, LocationIn,
   LocationServiceIn, LocationServiceOut,
   Organization, OrganizationIn,
   ServiceIn,
 } from '../types'
-import * as React from 'react'
+
 
 // ─────────────────────────────────────────────────────────────
 // Selection state carried up to the shell
@@ -497,6 +499,10 @@ function LocationsView({
     }
   }
 
+  // Fallback when Photon's autocomplete doesn't surface what the user
+  // means. Uses /api/geocode (single best hit) against the free-form
+  // text in the field. Kept because autocomplete requires a suggestion
+  // to exist for the typed text, and that isn't always the case.
   async function geocodeAddress() {
     const address = draft?.address?.trim()
     if (!address) return
@@ -523,6 +529,9 @@ function LocationsView({
       setGeocoding(false)
     }
   }
+
+  const needsCoords =
+    !!draft?.address?.trim() && (!draft.latitude || !draft.longitude)
 
   return (
     <div className="grid gap-6 lg:grid-cols-[2fr_3fr]">
@@ -599,25 +608,52 @@ function LocationsView({
             </Field>
 
             <Field label="Address">
-              <div className="flex gap-2">
-                <input
-                  className={input}
-                  placeholder="123 Main St, City, Country"
-                  value={draft.address ?? ''}
-                  onChange={(e) =>
-                    setDraft({ ...draft, address: e.target.value || null })
-                  }
-                />
-                <button
-                  type="button"
-                  onClick={geocodeAddress}
-                  disabled={geocoding || !draft.address?.trim()}
-                  className="whitespace-nowrap rounded-lg border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                >
-                  {geocoding ? 'Looking up…' : 'Find coordinates'}
-                </button>
-              </div>
+              <AddressAutocomplete
+                value={draft.address ?? ''}
+                onChange={(v) => {
+                  setDraft((d) => (d ? { ...d, address: v || null } : d))
+                  setGeocodeErr(null)
+                  setGeocodeNote(null)
+                }}
+                onSelect={(s) => {
+                  // Picking a suggestion is authoritative: store the
+                  // Photon label as the address. Fall back to the city
+                  // or postcode if Photon somehow returns an empty
+                  // label, so the input never goes blank.
+                  setDraft((d) => {
+                    if (!d) return d
+                    const resolved =
+                      s.display_name?.trim()
+                      || s.city?.trim()
+                      || s.postcode?.trim()
+                      || d.address
+                      || ''
+                    return {
+                      ...d,
+                      address: resolved || null,
+                      latitude: String(s.lat),
+                      longitude: String(s.lng),
+                    }
+                  })
+                  setGeocodeErr(null)
+                  setGeocodeNote('Coordinates resolved.')
+                }}
+                placeholder="123 Main St, City, Country"
+              />
             </Field>
+
+            {needsCoords && (
+              <button
+                type="button"
+                onClick={geocodeAddress}
+                disabled={geocoding}
+                className="text-xs text-slate-500 underline hover:text-slate-900 disabled:opacity-50"
+              >
+                {geocoding
+                  ? 'Looking up…'
+                  : "Can't find it above? Try best match"}
+              </button>
+            )}
             {geocodeErr && (
               <p className="text-xs text-red-600">{geocodeErr}</p>
             )}
@@ -629,7 +665,7 @@ function LocationsView({
               <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-600">
                 {draft.latitude && draft.longitude
                   ? `${draft.latitude}, ${draft.longitude}`
-                  : 'Not geocoded yet — enter an address and click “Find coordinates”.'}
+                  : 'Not geocoded yet — pick a suggestion above.'}
               </div>
             </Field>
 

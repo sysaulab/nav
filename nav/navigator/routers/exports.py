@@ -20,7 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..backup import export_directory, import_directory
-from ..db import get_db, get_engine
+from ..db import get_db
 
 router = APIRouter(prefix="/export", tags=["export"])
 
@@ -155,15 +155,11 @@ async def import_database(
     except ValueError as e:
         raise HTTPException(400, f"invalid JSON: {e}")
 
-    engine = get_engine()
-    is_postgres = engine.dialect.name == "postgresql"
-
-    if is_postgres:
-        # Serialise concurrent imports across replicas. Transaction-
-        # scoped: the lock releases on commit or rollback. The value
-        # is the same on every replica, so a second import blocks
-        # until the first completes (or fails).
-        await db.execute(text(f"SELECT pg_advisory_xact_lock({_IMPORT_LOCK_KEY})"))
+    # Serialise concurrent imports across replicas. Transaction-scoped:
+    # the lock releases on commit or rollback. The value is the same on
+    # every replica, so a second import blocks until the first completes
+    # (or fails).
+    await db.execute(text(f"SELECT pg_advisory_xact_lock({_IMPORT_LOCK_KEY})"))
 
     try:
         counts = await import_directory(db, payload, mode=mode)

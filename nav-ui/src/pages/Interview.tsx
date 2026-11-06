@@ -1,19 +1,20 @@
 // web-ui/src/pages/Interview.tsx
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import * as React from 'react'
 import { api, isSessionError } from '../api'
 import { Pill, type PillTone } from '../components/Pill'
+import FileDropzone from '../components/FileDropzone'
+import { AddressAutocomplete } from '../components/AddressAutocomplete'
+import { matchesAccept } from '../util/files.tsx'
+import { usePrivacy } from '../privacy/PrivacyContext'
+import { SessionClock } from '../components/SessionClock'
 import type {
   ChatItem, ChatMessage, ContextPrompt, DocumentMeta, GeocodeSuggestion,
   InterviewSession, ServiceCard, SessionLocation,
 } from '../types'
-import FileDropzone from '../components/FileDropzone'
-import { matchesAccept } from '../util/files.tsx'
-import * as React from 'react'
-import { usePrivacy } from '../privacy/PrivacyContext'
-import { SessionClock } from '../components/SessionClock'
 
 type Upload = { id: string; filename: string; pct: number }
 
@@ -745,6 +746,9 @@ function SessionExpiredModal() {
 // ─────────────────────────────────────────────────────────────
 // Location gate — debounced autocomplete over /api/geocode/search
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Location gate — autocomplete over /api/geocode/search
+// ─────────────────────────────────────────────────────────────
 function LocationGate({
   session,
   onLocated,
@@ -761,62 +765,22 @@ function LocationGate({
   const [query, setQuery] = useState(
     session.origin_display_name || session.postal_code || '',
   )
-  const [suggestions, setSuggestions] = useState<GeocodeSuggestion[]>([])
-  const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [highlighted, setHighlighted] = useState(-1)
 
-  const abortRef = useRef<AbortController | null>(null)
-  const timerRef = useRef<number | null>(null)
-
-  // Abort any in-flight lookup when the gate unmounts.
-  useEffect(() => {
-    return () => { abortRef.current?.abort() }
-  }, [])
-
-  // Debounced lookup; aborts the previous in-flight request.
-  useEffect(() => {
-    if (timerRef.current !== null) window.clearTimeout(timerRef.current)
-    const q = query.trim()
-    if (q.length < 2) {
-      setSuggestions([])
-      setOpen(false)
-      setHighlighted(-1)
-      return
-    }
-    timerRef.current = window.setTimeout(async () => {
-      abortRef.current?.abort()
-      const ctrl = new AbortController()
-      abortRef.current = ctrl
-      try {
-        const list = await api.geocodeSearch(q, ctrl.signal)
-        if (ctrl.signal.aborted) return
-        setSuggestions(list)
-        setOpen(list.length > 0)
-        setHighlighted(list.length > 0 ? 0 : -1)
-      } catch (e) {
-        if ((e as Error).name !== 'AbortError') {
-          // Silent — the submit path surfaces real geocoder errors.
-        }
-      }
-    }, 300)
-    return () => {
-      if (timerRef.current !== null) window.clearTimeout(timerRef.current)
-    }
-  }, [query])
-
-  async function commit(s: GeocodeSuggestion) {
+  async function onSelect(s: GeocodeSuggestion) {
     setBusy(true)
     setError(null)
-    setOpen(false)
     try {
       const loc = await api.interviews.setLocation(session.id, {
-        postal_code: s.postcode || query.trim(),
+        // postal_code is the "location label" the session stores for the
+        // prompt header. Prefer the real postcode; fall back to the city,
+        // then to what the user typed. The full address lives in
+        // display_name.
+        postal_code: s.postcode || s.city || query.trim(),
         lat: s.lat,
         lng: s.lng,
         display_name: s.display_name,
-        short_display_name: s.short_display_name,
       })
       onLocated(loc)
     } catch (e) {
@@ -829,17 +793,13 @@ function LocationGate({
       setBusy(false)
     }
   }
-
+  
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     if (busy) return
-    if (highlighted >= 0 && suggestions[highlighted]) {
-      return void commit(suggestions[highlighted])
-    }
-    if (suggestions.length > 0) {
-      return void commit(suggestions[0])
-    }
-    // No candidate yet — let the backend geocode + shorten the text.
+    // Free-text fallback: let the backend geocode the typed string and
+    // shorten it. Used when the user hits Enter without picking a
+    // suggestion, or when Photon had no suggestions for what they typed.
     setBusy(true)
     setError(null)
     try {
@@ -855,18 +815,6 @@ function LocationGate({
       setError((err as Error).message)
     } finally {
       setBusy(false)
-    }
-  }
-
-  function onKey(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault()
-      setHighlighted((h) => Math.min(suggestions.length - 1, h + 1))
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      setHighlighted((h) => Math.max(0, h - 1))
-    } else if (e.key === 'Escape') {
-      setOpen(false)
     }
   }
 
@@ -896,48 +844,15 @@ function LocationGate({
             Start typing a postal code or address — pick a suggestion to continue.
           </p>
 
-          <div className="relative mt-4">
-            <input
-              autoFocus
+          <div className="mt-4">
+            <AddressAutocomplete
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={onKey}
-              onFocus={() => { if (suggestions.length > 0) setOpen(true) }}
-              onBlur={() => {
-                // Let click handlers fire before closing the list.
-                window.setTimeout(() => setOpen(false), 120)
-              }}
+              onChange={setQuery}
+              onSelect={(s) => void onSelect(s)}
               placeholder="e.g. M5V 2T6 or 123 Queen St W"
-              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
               disabled={busy}
-              autoComplete="off"
+              autoFocus
             />
-            {open && suggestions.length > 0 && (
-              <ul className="absolute left-0 right-0 z-10 mt-1 max-h-64 overflow-y-auto rounded-lg border border-slate-200 bg-white shadow-lg">
-                {suggestions.map((s, i) => (
-                  <li key={`${s.lat},${s.lng},${i}`}>
-                    <button
-                      type="button"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => void commit(s)}
-                      onMouseEnter={() => setHighlighted(i)}
-                      className={`block w-full px-3 py-2 text-left text-sm ${
-                        i === highlighted ? 'bg-slate-100' : 'hover:bg-slate-50'
-                      }`}
-                    >
-                      <div className="font-medium text-slate-900">
-                        {s.short_display_name}
-                      </div>
-                      {s.display_name && s.display_name !== s.short_display_name && (
-                        <div className="line-clamp-1 text-xs text-slate-500">
-                          {s.display_name}
-                        </div>
-                      )}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
           </div>
 
           <button

@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from ..geocode import short_display
+from ..geocode import photon_display_name
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -119,11 +119,6 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _aware(dt: datetime) -> datetime:
-    """SQLite drops tzinfo on DateTime(timezone=True). Normalize to UTC."""
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-
-
 # ── session helpers ───────────────────────────────────────
 
 async def _require_active(
@@ -138,7 +133,7 @@ async def _require_active(
     if sess.status == "ended":
         raise HTTPException(409, "session has ended")
     now = _now()
-    if _aware(sess.expires_at) <= now:
+    if sess.expires_at <= now:
         sess.status = "expired"
         await db.commit()
         raise HTTPException(410, "session expired")
@@ -167,7 +162,7 @@ async def create_or_resume_session(
 
     if sid is not None:
         sess = await db.get(InterviewSession, sid)
-        if sess is not None and sess.status == "active" and _aware(sess.expires_at) > now:
+        if sess is not None and sess.status == "active" and sess.expires_at > now:
             sess.expires_at = now + timedelta(minutes=cfg.session_idle_minutes)
             await db.commit()
             await db.refresh(sess)
@@ -198,7 +193,7 @@ async def get_active_session(
     sess = await db.get(InterviewSession, sid)
     if sess is None or sess.status != "active":
         return None
-    if _aware(sess.expires_at) <= _now():
+    if sess.expires_at <= _now():
         return None
     return sess
 
@@ -243,18 +238,15 @@ async def set_location(
 
     if payload.lat is not None and payload.lng is not None:
         # Client picked a candidate from /api/geocode/search — trust it,
-        # skip the round-trip to Nominatim.
+        # skip the round-trip to Photon. display_name is the full label
+        # the client already has in hand.
         lat = payload.lat
         lng = payload.lng
-        display_name = (
-            payload.short_display_name
-            or payload.display_name
-            or payload.postal_code
-        )
+        display_name = payload.display_name or payload.postal_code
     else:
         # Free-text fallback (Enter without a candidate). Photon handles
         # typos; its response is GeoJSON with flat property fields, so we
-        # build the display label inline instead of using short_display().
+        # build the display label from those.
         endpoint = cfg.photon_endpoint.rstrip("/")
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -286,28 +278,10 @@ async def set_location(
         except (TypeError, ValueError):
             raise HTTPException(502, "photon returned malformed coordinates")
 
-        name        = props.get("name")
-        street      = props.get("street")
-        housenumber = props.get("housenumber")
-        city        = props.get("city")
-        postcode    = props.get("postcode")
-
-        # short label: prefer "number street", else name, else street; + city
-        short_parts: list[str] = []
-        if housenumber and street:
-            short_parts.append(f"{housenumber} {street}")
-        elif name:
-            short_parts.append(name)
-        elif street:
-            short_parts.append(street)
-        if city:
-            short_parts.append(city)
-        display_name = ", ".join(short_parts) or payload.postal_code
-
+        display_name = photon_display_name(props) or payload.postal_code
         lat = Decimal(str(lat_f))
         lng = Decimal(str(lon_f))
 
-    
     sess.postal_code = payload.postal_code.strip()
     sess.origin_lat = lat
     sess.origin_lng = lng
@@ -318,7 +292,7 @@ async def set_location(
     # change.
     rows = await _nearby_services(
         db, lat, lng, cfg.postcode_radius_km,
-+       cfg.nearby_location_limit, cfg.nearby_index_limit,
+        cfg.nearby_location_limit, cfg.nearby_index_limit,
     )
     sess.nearby_service_ids = [str(svc.id) for svc, _l, _d in rows]
     sess.revealed_service_indices = []
@@ -634,7 +608,7 @@ def _render_nearby(
     display_name: str | None,
     revealed: set[int],
 ) -> str:
-    header = f"## Customer location\n{postal_code}"
+    header = f"## Customer location\n{display_name or postal_code}"
     if display_name:
         header += f" — {display_name}"
     if not items:

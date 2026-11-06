@@ -2,7 +2,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    database_url: str = "sqlite+aiosqlite:///./navigator.db"
+    # Required — no SQLite fallback. If NAVIGATOR_DATABASE_URL is unset
+    # (or --db-url not passed on the CLI), Settings() raises at construction
+    # and the app refuses to start. That's deliberate: a silent SQLite file
+    # is worse than a startup failure, because it hides the fact that the
+    # operator didn't configure the deployment.
+    database_url: str
 
     # Private Photon instance (used for address → lat/lng).
     photon_endpoint: str = "http://127.0.0.1:2322"
@@ -13,7 +18,7 @@ class Settings(BaseSettings):
     sanitizer_endpoint: str = "http://127.0.0.1:8000/ingest"   # ← canonical
     sanitizer_timeout_s: float = 600.0
     max_upload_bytes: int = 100 * 1024 * 1024
-    
+
     # ── chat backend (Ollama) ───────────────────────────────
     ollama_endpoint: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma4:cloud"

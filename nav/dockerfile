@@ -38,12 +38,13 @@ ENV HF_HOME=/app/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
 
-RUN useradd -m -u 1000 maestro \
-    && mkdir -p /data && chown maestro:maestro /data
+RUN useradd -m -u 1000 maestro
 USER maestro
 
-ENV NAVIGATOR_DATABASE_URL="sqlite+aiosqlite:////data/navigator.db" \
-    NAVIGATOR_SANITIZER_ENDPOINT="http://sanitizer:8000/ingest" \
+# No NAVIGATOR_DATABASE_URL default. The service must be told where its
+# database is — a silent SQLite fallback was worse than a startup failure,
+# because it hid the fact that the operator hadn't configured the deploy.
+ENV NAVIGATOR_SANITIZER_ENDPOINT="http://sanitizer:8000/ingest" \
     NAVIGATOR_PHOTON_ENDPOINT="http://photon:2322" \
     NAVIGATOR_OLLAMA_ENDPOINT="http://host.docker.internal:11434"
 

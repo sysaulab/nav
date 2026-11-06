@@ -87,11 +87,11 @@ export interface InterviewSession {
 export interface GeocodeSuggestion {
   lat: number
   lng: number
-  display_name: string | null
-  short_display_name: string
+  display_name: string
   postcode: string | null
   city: string | null
 }
+
 export interface SessionLocation {
   postal_code: string | null
   origin_lat: string | null

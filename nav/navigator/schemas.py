@@ -112,7 +112,6 @@ class PostalCodeIn(_In):
     lat: Decimal | None = Field(default=None, ge=-90, le=90)
     lng: Decimal | None = Field(default=None, ge=-180, le=180)
     display_name: str | None = Field(default=None, max_length=1024)
-    short_display_name: str | None = Field(default=None, max_length=512)
 
 
 class SessionLocationOut(_Out):

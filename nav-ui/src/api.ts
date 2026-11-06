@@ -265,7 +265,6 @@ export const api = {
         lat?: number
         lng?: number
         display_name?: string | null
-        short_display_name?: string | null
       },
     ) =>
       request<import('./types').SessionLocation>(`/interviews/${sid}/location`, {
