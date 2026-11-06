@@ -80,7 +80,23 @@ export default function Interview() {
 
   // ── upload ────────────────────────────────────────────
 const ACCEPT =
-  '.pdf,.txt,.md,.docx,.doc,.odt,.rtf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
+  '.rtf,.pdf,.txt,.md,.docx,.odt,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
+
+const BLOCKED_LEGACY: Record<string, string> = {
+  '.doc': '.docx',
+  '.xls': '.xlsx',
+  '.ppt': '.pptx',
+}
+
+function legacyOfficeHint(filename: string): string | null {
+  const i = filename.lastIndexOf('.')
+  if (i < 0) return null
+  const ext = filename.slice(i).toLowerCase()
+  const replacement = BLOCKED_LEGACY[ext]
+  return replacement
+    ? `${filename}: ${ext} (Office 97-2003) is not supported — re-save as ${replacement} and re-upload.`
+    : null
+}
 
 async function verifyExpired() {
   if (!session) return
@@ -110,15 +126,30 @@ async function onFiles(files: File[]) {
   setError(null)
   try {
     const accepted = files.filter((f) => matchesAccept(f, ACCEPT))
-    const rejected = files.length - accepted.length
+    const rejectedFiles = files.filter((f) => !matchesAccept(f, ACCEPT))
 
     if (accepted.length === 0) {
-      setError('Unsupported file type. Accepted: PDF, Office, images, plain text.')
+      const hints = rejectedFiles
+        .map((f) => legacyOfficeHint(f.name))
+        .filter((h): h is string => h !== null)
+      setError(
+        hints.length > 0
+          ? hints.join(' · ')
+          : 'Unsupported file type. Accepted: PDF, Office (OOXML), images, plain text.',
+      )
       return
     }
-    if (rejected > 0) {
-      setError(`${rejected} file(s) skipped — unsupported type`)
+    if (rejectedFiles.length > 0) {
+      const hints = rejectedFiles
+        .map((f) => legacyOfficeHint(f.name))
+        .filter((h): h is string => h !== null)
+      setError(
+        hints.length > 0
+          ? hints.join(' · ')
+          : `${rejectedFiles.length} file(s) skipped — unsupported type`,
+      )
     }
+
 
     for (const f of accepted) {
       const id = newUid()

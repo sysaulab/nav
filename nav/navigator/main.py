@@ -11,7 +11,7 @@ import logging
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
-from sqlalchemy import delete as sa_delete, select
+from sqlalchemy import delete as sa_delete, select, text
 
 from .config import Settings
 from .db import get_engine, get_sessionmaker, init_engine
@@ -30,7 +30,21 @@ log = logging.getLogger("navigator")
 
 async def _purge_expired_sessions() -> int:
     now = datetime.now(timezone.utc)
+    engine = get_engine()
+    is_postgres = engine.url.get_backend_name() == "postgresql"
+
     async with get_sessionmaker()() as db:
+        # Postgres: exactly one replica purges per tick. A replica
+        # that crashes mid-purge releases the lock on rollback.
+        # SQLite: no lock — the existing path already runs on a
+        # single process.
+        if is_postgres:
+            got = (await db.execute(
+                text("SELECT pg_try_advisory_xact_lock(920111)")
+            )).scalar()
+            if not got:
+                return 0
+
         rows = (await db.execute(
             select(InterviewSession.id, InterviewSession.expires_at)
         )).all()
@@ -39,7 +53,9 @@ async def _purge_expired_sessions() -> int:
             await db.execute(
                 sa_delete(InterviewSession).where(InterviewSession.id.in_(expired))
             )
-            await db.commit()
+        # Commit unconditionally: on Postgres this is what releases
+        # the advisory lock, even when there was nothing to delete.
+        await db.commit()
     return len(expired)
 
 
@@ -84,7 +100,15 @@ def create_app(settings: Settings) -> FastAPI:
     async def _create_schema():
         engine = get_engine()
         async with engine.begin() as conn:
+            # Postgres: serialize schema creation across replicas.
+            # pg_advisory_xact_lock releases on commit, so a crashed
+            # replica cannot leave the lock held. The key is arbitrary
+            # but must be identical on every replica.
+            if not settings.database_url.startswith("sqlite"):
+                await conn.execute(text("SELECT pg_advisory_xact_lock(920110)"))
+
             await conn.run_sync(Base.metadata.create_all)
+
             # SQLite can't add columns via create_all; patch in `address` if missing.
             # Patch-in columns that `create_all` can't add to existing SQLite DBs.
             if settings.database_url.startswith("sqlite"):
@@ -307,7 +331,7 @@ def create_app(settings: Settings) -> FastAPI:
             "service": "maestro",
             "version": app.version,
             "sanitizer": settings.sanitizer_endpoint,
-            "geocoder": settings.nominatim_endpoint,
+            "geocoder": settings.photon_endpoint,
             "ollama": settings.ollama_endpoint,
             "model": settings.ollama_model,
         }
@@ -387,7 +411,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--db-url", default=None)
     parser.add_argument("--ingest-server-endpoint", default=None)
-    parser.add_argument("--nominatim-endpoint", default=None)
+    parser.add_argument("--photon-endpoint", default=None)
     args = parser.parse_args()
 
     overrides = {}
@@ -395,8 +419,8 @@ def main() -> None:
         overrides["database_url"] = args.db_url
     if args.ingest_server_endpoint:
         overrides["sanitizer_endpoint"] = args.ingest_server_endpoint
-    if args.nominatim_endpoint:
-        overrides["nominatim_endpoint"] = args.nominatim_endpoint
+    if args.photon_endpoint:
+        overrides["photon_endpoint"] = args.photon_endpoint
     settings = Settings().model_copy(update=overrides)
 
     uvicorn.run(create_app(settings), host=args.host, port=args.port)

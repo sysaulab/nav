@@ -44,12 +44,12 @@ USER maestro
 
 ENV NAVIGATOR_DATABASE_URL="sqlite+aiosqlite:////data/navigator.db" \
     NAVIGATOR_SANITIZER_ENDPOINT="http://sanitizer:8000/ingest" \
-    NAVIGATOR_NOMINATIM_ENDPOINT="http://nominatim-bc:8080" \
+    NAVIGATOR_PHOTON_ENDPOINT="http://photon:2322" \
     NAVIGATOR_OLLAMA_ENDPOINT="http://host.docker.internal:11434"
 
 EXPOSE 8001
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
-    CMD curl -sf http://host.docker.internal:8001/api/health || exit 1
+    CMD curl -sf http://127.0.0.1:8001/api/health || exit 1
 
 CMD ["python", "-m", "navigator", "--host", "0.0.0.0", "--port", "8001"]

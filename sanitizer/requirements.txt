@@ -5,7 +5,8 @@ officemd==0.1.8
 
 # docling 2.113.0 is the current stable; floor must include [opendocument]
 # so odfdo is pulled in as a transitive dependency.
-docling[format-opendocument]==2.113.0
+docling[format-opendocument]==2.114.0
+odfdo==3.27.3
 pymupdf==1.28.2
 
 

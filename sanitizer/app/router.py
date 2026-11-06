@@ -32,6 +32,8 @@ from app.handlers.quarantine import quarantine
 from app.handlers.text import handle_text
 from app.models import Document
 
+from app.handlers.rtf import handle_rtf
+
 try:
     import magic  # python-magic; needs libmagic on the host
 except ImportError:
@@ -47,7 +49,7 @@ except ImportError:
 OFFICE_EXTS = {".docx", ".xlsx", ".pptx"}
 
 # Route these to Docling (ODF + legacy binary + RTF)
-DOCLING_EXTS = {".odt", ".ods", ".odp", ".doc", ".xls", ".ppt", ".rtf"}
+DOCLING_EXTS = {".odt", ".ods", ".odp"}
 
 OFFICE_MIMES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -59,10 +61,21 @@ DOCLING_MIMES = {
     "application/vnd.oasis.opendocument.text",
     "application/vnd.oasis.opendocument.spreadsheet",
     "application/vnd.oasis.opendocument.presentation",
+}
+
+RTF_EXTS = {".rtf"}
+RTF_MIMES = {"application/rtf", "text/rtf"}
+
+
+# Classic Office 97-2003 binary formats (OLE2/CFB). Docling can only parse
+# these via LibreOffice headless (>=2.114) — a ~500 MB image dependency.
+# Reject up front with a "save as OOXML" hint rather than let Docling fail
+# with a generic "File format not allowed".
+BLOCKED_LEGACY_EXTS = {".doc", ".xls", ".ppt"}
+BLOCKED_LEGACY_MIMES = {
     "application/msword",
     "application/vnd.ms-excel",
     "application/vnd.ms-powerpoint",
-    "application/rtf",
 }
 
 PDF_EXTS = {".pdf"}
@@ -107,7 +120,19 @@ def route(path: Path | str, *, display_name: str | None = None) -> Document:
     sniffed = sniff_mime(raw, path.name)
     ext = path.suffix.lower()
 
-    if ext in DOCLING_EXTS or sniffed in DOCLING_MIMES:
+    if ext in BLOCKED_LEGACY_EXTS or sniffed in BLOCKED_LEGACY_MIMES:
+        doc = quarantine(
+            doc_id, path, declared, sniffed,
+            route="blocked_legacy_office", converter="none",
+            reason=(
+                f"legacy_binary_office_unsupported: {ext or 'unknown'} is a "
+                f"classic Office 97-2003 binary format. Save the file as "
+                f"OOXML (.docx / .xlsx / .pptx) and re-upload."
+            ),
+        )
+    elif ext in RTF_EXTS or sniffed in RTF_MIMES:
+        doc = handle_rtf(path, raw, doc_id, declared, sniffed)
+    elif ext in DOCLING_EXTS or sniffed in DOCLING_MIMES:
         doc = handle_docling(path, raw, doc_id, declared, sniffed,
                              route_name="docling_office")
     elif ext in OFFICE_EXTS or sniffed in OFFICE_MIMES or declared in OFFICE_MIMES:
@@ -126,9 +151,6 @@ def route(path: Path | str, *, display_name: str | None = None) -> Document:
                          reason=f"unsupported_format: ext={ext!r} "
                                 f"declared={declared!r} sniffed={sniffed!r}")
 
-    # Handlers populate source.filename from path.name. When the caller has
-    # provided a display name (upload path, CLI alias), override it here so
-    # a spool file like tmpXYZ.pdf never appears in the response.
     if display_name:
         doc.source["filename"] = display_name
     return doc

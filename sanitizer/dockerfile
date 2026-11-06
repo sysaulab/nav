@@ -16,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # libgomp1: onnxruntime OpenMP runtime
 # libmagic1: python-magic
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 libglib2.0-0 libgomp1 libmagic1 \
+        libgl1 libglib2.0-0 libgomp1 libmagic1 pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -u 10001 -m -s /sbin/nologin app

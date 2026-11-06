@@ -1,6 +1,5 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -25,7 +24,6 @@ class OrganizationIn(_In):
     logo: str | None = None
     uri: str | None = None
     parent_organization_id: UUID | None = None
-    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class OrganizationOut(OrganizationIn, _Out):
@@ -42,7 +40,6 @@ class LocationIn(_In):
     address: str | None = None
     latitude: Decimal | None = Field(default=None, ge=-90, le=90)
     longitude: Decimal | None = Field(default=None, ge=-180, le=180)
-    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class LocationOut(LocationIn, _Out):
@@ -69,7 +66,6 @@ class ServiceIn(_In):
     assured_date: datetime | None = None
     alert: str | None = None
     last_modified: datetime | None = None
-    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class ServiceOut(ServiceIn, _Out):
@@ -82,7 +78,6 @@ class ServiceAtLocationIn(_In):
     service_id: UUID
     location_id: UUID
     description: str | None = None
-    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class ServiceAtLocationOut(ServiceAtLocationIn, _Out):
@@ -98,8 +93,6 @@ class LocationServiceIn(ServiceIn):
 class LocationServiceOut(ServiceOut):
     service_at_location_id: UUID
 
-
-# ── Interview sessions, documents, chat ───────────────────
 
 # ── Interview sessions, documents, chat ───────────────────
 

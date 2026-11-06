@@ -10,7 +10,6 @@ export interface Organization {
   logo: string | null
   uri: string | null
   parent_organization_id: string | null
-  extra: Record<string, unknown>
   created_at: string
   updated_at: string
 }
@@ -26,7 +25,6 @@ export interface Location {
   address: string | null
   latitude: string | null
   longitude: string | null
-  extra: Record<string, unknown>
   created_at: string
   updated_at: string
 }
@@ -51,7 +49,6 @@ export interface Service {
   assured_date: string | null
   alert: string | null
   last_modified: string | null
-  extra: Record<string, unknown>
   created_at: string
   updated_at: string
 }
@@ -63,7 +60,6 @@ export interface ServiceAtLocation {
   service_id: string
   location_id: string
   description: string | null
-  extra: Record<string, unknown>
   created_at: string
   updated_at: string
 }

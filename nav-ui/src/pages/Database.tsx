@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api'
 import type {
@@ -19,6 +19,108 @@ export default function Database() {
   const [org, setOrg] = useState<SelOrg>(null)
   const [loc, setLoc] = useState<SelLoc>(null)
 
+  // Bumped after an import to force the top-level view to remount
+  // with a fresh load. Children keyed off this state unmount and
+  // their useEffect runs from scratch.
+  const [refreshKey, setRefreshKey] = useState(0)
+
+  // Import/export live state.
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
+  const [importing, setImporting] = useState(false)
+  const [importError, setImportError] = useState<string | null>(null)
+  const [importResult, setImportResult] = useState<Record<string, number> | null>(null)
+
+  async function handleExport() {
+    setExporting(true)
+    setExportError(null)
+    try {
+      const res = await fetch('/api/export/database')
+      if (!res.ok) throw new Error(await res.text())
+      const blob = await res.blob()
+      const cd = res.headers.get('content-disposition') ?? ''
+      const match = cd.match(/filename="([^"]+)"/)
+      const filename = match?.[1] ?? 'navigator-backup.json'
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      setExportError((e as Error).message)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  function openImportPicker() {
+    fileInputRef.current?.click()
+  }
+
+  async function handleImportFile(file: File) {
+    setImportError(null)
+    setImportResult(null)
+
+    // Parse client-side so the confirmation shows the shape of the
+    // import. A malformed file fails here, before any bytes are sent.
+    let summary = ''
+    try {
+      const text = await file.text()
+      const payload = JSON.parse(text) as {
+        format_version?: string
+        tables?: Record<string, unknown>
+      }
+      if (!payload.tables) {
+        setImportError('File does not contain a "tables" object')
+        return
+      }
+      const lines = Object.entries(payload.tables).map(([k, v]) =>
+        `  ${k}: ${Array.isArray(v) ? v.length : '?'}`,
+      )
+      summary = `\n\nFormat: ${payload.format_version ?? 'unknown'}\n${lines.join('\n')}`
+    } catch (e) {
+      setImportError(`Not a valid JSON backup: ${(e as Error).message}`)
+      return
+    }
+
+    const confirmed = window.confirm(
+      `Replace all directory data with the contents of "${file.name}"?` +
+      summary +
+      '\n\nThis cannot be undone. Session state is preserved.',
+    )
+    if (!confirmed) return
+
+    setImporting(true)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      form.append('mode', 'replace')
+      const res = await fetch('/api/export/database/import', {
+        method: 'POST',
+        body: form,
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const result = await res.json() as { counts?: Record<string, number> }
+      setImportResult(result.counts ?? {})
+      // Reset the current drill-down and force the top-level list to reload.
+      setOrg(null)
+      setLoc(null)
+      setRefreshKey((k) => k + 1)
+    } catch (e) {
+      setImportError((e as Error).message)
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const totalImported = importResult
+    ? Object.values(importResult).reduce((a, b) => a + b, 0)
+    : null
+
   return (
     <main className="min-h-screen bg-slate-50 p-8">
       <div className="mx-auto max-w-6xl">
@@ -26,12 +128,66 @@ export default function Database() {
           ← Back
         </Link>
 
-        <header className="mt-6 mb-6">
-          <h1 className="text-3xl font-semibold text-slate-900">Manage resources</h1>
-          <p className="mt-2 text-slate-600">
-            Organizations → locations → services. A service always belongs to a location.
-          </p>
+        <header className="mt-6 mb-6 flex items-start justify-between gap-6">
+          <div>
+            <h1 className="text-3xl font-semibold text-slate-900">Manage resources</h1>
+            <p className="mt-2 text-slate-600">
+              Organizations → locations → services. A service always belongs to a location.
+            </p>
+          </div>
+          <div className="flex shrink-0 items-start gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                if (fileInputRef.current) fileInputRef.current.value = ''
+                if (f) void handleImportFile(f)
+              }}
+            />
+            <button
+              onClick={() => void handleExport()}
+              disabled={exporting || importing}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+            >
+              {exporting ? 'Exporting…' : '↓ Export JSON'}
+            </button>
+            <button
+              onClick={openImportPicker}
+              disabled={exporting || importing}
+              className="rounded-lg border border-red-300 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+            >
+              {importing ? 'Importing…' : '↑ Import JSON'}
+            </button>
+          </div>
         </header>
+
+        {exportError && (
+          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+            Export failed: {exportError}
+          </div>
+        )}
+        {importError && (
+          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+            Import failed: {importError}
+          </div>
+        )}
+        {importResult && (
+          <div className="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+            <div className="font-medium">
+              Import complete — {totalImported ?? 0} rows
+            </div>
+            <ul className="mt-1 grid grid-cols-2 gap-x-4 gap-y-0.5 font-mono text-xs sm:grid-cols-3">
+              {Object.entries(importResult).map(([k, v]) => (
+                <li key={k}>
+                  {k}: <span className="text-emerald-700">{v}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         <nav className="mb-6 flex flex-wrap items-center gap-1 text-sm">
           <Crumb active={!org} onClick={() => { setOrg(null); setLoc(null) }}>
@@ -53,7 +209,7 @@ export default function Database() {
           )}
         </nav>
 
-        {!org && <OrganizationsView onSelect={setOrg} />}
+        {!org && <OrganizationsView key={refreshKey} onSelect={setOrg} />}
         {org && !loc && (
           <LocationsView
             org={org}
@@ -156,14 +312,10 @@ function OrganizationsView({ onSelect }: { onSelect: (o: { id: string; name: str
     logo: null,
     uri: null,
     parent_organization_id: null,
-    extra: {},
   }
 
   async function save() {
     if (!draft) return
-    // Build a clean OrganizationIn body. We must not echo back `id`,
-    // `created_at`, or `updated_at` when editing — the backend model uses
-    // extra="forbid" and will 422 otherwise.
     const body: OrganizationIn = {
       name: draft.name,
       alternate_name: draft.alternate_name,
@@ -175,7 +327,6 @@ function OrganizationsView({ onSelect }: { onSelect: (o: { id: string; name: str
       logo: draft.logo,
       uri: draft.uri,
       parent_organization_id: draft.parent_organization_id,
-      extra: draft.extra,
     }
     try {
       if ('id' in draft && typeof (draft as { id?: string }).id === 'string') {
@@ -318,14 +469,11 @@ function LocationsView({
     address: null,
     latitude: null,
     longitude: null,
-    extra: {},
   }
 
   async function save() {
     if (!draft) return
     try {
-      // Build a clean LocationIn — do not echo id/created_at/updated_at back
-      // (the backend uses extra="forbid" on LocationIn).
       const body: LocationIn = {
         organization_id: draft.organization_id ?? org.id,
         name: draft.name,
@@ -334,7 +482,6 @@ function LocationsView({
         address: draft.address,
         latitude: draft.latitude,
         longitude: draft.longitude,
-        extra: draft.extra,
       }
       if ('id' in draft && typeof (draft as { id?: string }).id === 'string') {
         await api.locations.update((draft as Location).id, body)
@@ -560,14 +707,12 @@ function LocationDetailView({
     assured_date: null,
     alert: null,
     last_modified: null,
-    extra: {},
   }
 
   async function save() {
     if (!draft) return
     try {
       if (editingId) {
-        // Update: reuse the top-level PATCH, supplying the org from the location.
         const body: ServiceIn = {
           ...draft,
           organization_id: location?.organization_id ?? org.id,
@@ -668,7 +813,6 @@ function LocationDetailView({
                       assured_date: s.assured_date,
                       alert: s.alert,
                       last_modified: s.last_modified,
-                      extra: s.extra,
                     })
                   }}
                   className="px-3 py-3 text-xs text-slate-500 hover:text-slate-900"

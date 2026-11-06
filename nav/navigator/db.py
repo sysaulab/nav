@@ -11,15 +11,24 @@ _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 def init_engine(settings: Settings) -> None:
     global _engine, _sessionmaker
-    _engine = create_async_engine(settings.database_url, pool_pre_ping=True)
 
-    # SQLite-only pragmas. FK enforcement is OFF by default in SQLite; without
-    # this, ondelete="CASCADE" is a no-op. WAL lets reads proceed while a
-    # write is in flight, which matters once the ingest side is writing
-    # document rows next to the resource edits.
+    engine_kwargs = {"pool_pre_ping": True}
+    if not settings.database_url.startswith("sqlite"):
+        # Postgres: explicit pool so N replicas × pool_size stays
+        # below Postgres's max_connections. Recycle before Postgres's
+        # idle timeout can drop a connection out from under us.
+        engine_kwargs.update(
+            pool_size=5,
+            max_overflow=5,
+            pool_recycle=1800,
+            pool_timeout=30,
+        )
+
+    _engine = create_async_engine(settings.database_url, **engine_kwargs)
+
     if settings.database_url.startswith("sqlite"):
         @event.listens_for(_engine.sync_engine, "connect")
-        def _sqlite_pragmas(dbapi_conn, _record):  # type: ignore[no-untyped-def]
+        def _sqlite_pragmas(dbapi_conn, _record):
             cur = dbapi_conn.cursor()
             cur.execute("PRAGMA foreign_keys=ON")
             cur.execute("PRAGMA journal_mode=WAL")
