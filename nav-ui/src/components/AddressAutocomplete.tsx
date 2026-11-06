@@ -9,8 +9,14 @@ type Props = {
   placeholder?: string
   disabled?: boolean
   autoFocus?: boolean
-  /** Called when a background lookup fails. The submit path surfaces real
-   *  errors separately; this is for debugging. */
+  /**
+   * When false, the input is still editable but no Photon lookup runs and
+   * the dropdown never opens. Used by "Freeze coordinates — edit address
+   * manually" mode: the user is deliberately typing an address that Photon
+   * won't match (e.g. an odd number missing from OSM), so querying it
+   * would only produce noise.
+   */
+  suggestionsEnabled?: boolean
   onLookupError?: (err: Error) => void
 }
 
@@ -29,6 +35,7 @@ export function AddressAutocomplete({
   placeholder,
   disabled,
   autoFocus,
+  suggestionsEnabled = true,
   onLookupError,
 }: Props) {
   const [suggestions, setSuggestions] = useState<GeocodeSuggestion[]>([])
@@ -44,10 +51,17 @@ export function AddressAutocomplete({
   const skipNextLookupRef = useRef(false)
 
   useEffect(() => {
-    return () => { abortRef.current?.abort() }
-  }, [])
+    if (!suggestionsEnabled) {
+      // Cancel any in-flight lookup and clear the dropdown. Typing
+      // continues to update `value` via the parent; nothing else happens.
+      abortRef.current?.abort()
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current)
+      setSuggestions([])
+      setOpen(false)
+      setHighlighted(-1)
+      return
+    }
 
-  useEffect(() => {
     if (skipNextLookupRef.current) {
       skipNextLookupRef.current = false
       setSuggestions([])
@@ -83,7 +97,7 @@ export function AddressAutocomplete({
     return () => {
       if (timerRef.current !== null) window.clearTimeout(timerRef.current)
     }
-  }, [value, onLookupError])
+  }, [value, onLookupError, suggestionsEnabled])
 
   function choose(s: GeocodeSuggestion) {
     skipNextLookupRef.current = true

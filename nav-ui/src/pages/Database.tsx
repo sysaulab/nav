@@ -448,6 +448,9 @@ function OrganizationsView({ onSelect }: { onSelect: (o: { id: string; name: str
 // ─────────────────────────────────────────────────────────────
 // View 2 — Locations for an organization
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// View 2 — Locations for an organization
+// ─────────────────────────────────────────────────────────────
 function LocationsView({
   org, onSelect, onOrgRenamed,
 }: {
@@ -461,6 +464,13 @@ function LocationsView({
   const [geocodeErr, setGeocodeErr] = useState<string | null>(null)
   const [geocodeNote, setGeocodeNote] = useState<string | null>(null)
 
+  // When true: lat/lng are locked, and the address field is free-text
+  // (autocomplete disabled). Used when Photon's data doesn't match reality
+  // — missing house numbers, wrong side of the street — and the operator
+  // needs to correct the address while keeping the nearest resolved point
+  // for distance ranking.
+  const [frozen, setFrozen] = useState(false)
+
   void onOrgRenamed // reserved for rename
 
   const empty: LocationIn = {
@@ -471,6 +481,25 @@ function LocationsView({
     address: null,
     latitude: null,
     longitude: null,
+  }
+
+  // Whether the draft currently has a resolved point. The freeze checkbox
+  // is disabled without coords — freezing "nothing" would save a location
+  // that silently never appears in distance-ranked results.
+  const hasCoords = !!(draft?.latitude && draft?.longitude)
+
+  function openDraft(d: LocationIn) {
+    setDraft(d)
+    setFrozen(false)
+    setGeocodeErr(null)
+    setGeocodeNote(null)
+  }
+
+  function closeDraft() {
+    setDraft(null)
+    setFrozen(false)
+    setGeocodeErr(null)
+    setGeocodeNote(null)
   }
 
   async function save() {
@@ -490,9 +519,7 @@ function LocationsView({
       } else {
         await api.locations.create(body)
       }
-      setDraft(null)
-      setGeocodeErr(null)
-      setGeocodeNote(null)
+      closeDraft()
       reload()
     } catch (e) {
       alert((e as Error).message)
@@ -500,9 +527,9 @@ function LocationsView({
   }
 
   // Fallback when Photon's autocomplete doesn't surface what the user
-  // means. Uses /api/geocode (single best hit) against the free-form
-  // text in the field. Kept because autocomplete requires a suggestion
-  // to exist for the typed text, and that isn't always the case.
+  // means AND freeze hasn't been used yet. Uses /api/geocode (single best
+  // hit) against the free-form text in the field. Once frozen, this button
+  // is hidden — coords are already locked by definition.
   async function geocodeAddress() {
     const address = draft?.address?.trim()
     if (!address) return
@@ -544,11 +571,7 @@ function LocationsView({
             </span>
           </h2>
           <button
-            onClick={() => {
-              setDraft({ ...empty })
-              setGeocodeErr(null)
-              setGeocodeNote(null)
-            }}
+            onClick={() => openDraft({ ...empty })}
             className="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white"
           >
             New location
@@ -573,11 +596,7 @@ function LocationsView({
                 </div>
               </button>
               <button
-                onClick={() => {
-                  setDraft(l)
-                  setGeocodeErr(null)
-                  setGeocodeNote(null)
-                }}
+                onClick={() => openDraft(l)}
                 className="px-3 py-3 text-xs text-slate-500 hover:text-slate-900"
               >
                 Edit
@@ -613,13 +632,12 @@ function LocationsView({
                 onChange={(v) => {
                   setDraft((d) => (d ? { ...d, address: v || null } : d))
                   setGeocodeErr(null)
-                  setGeocodeNote(null)
+                  // When frozen, keep the note honest: the coords are the
+                  // *previous* resolved point, not the currently-typed
+                  // address. Don't clear it, it's the whole point of freezing.
+                  if (!frozen) setGeocodeNote(null)
                 }}
                 onSelect={(s) => {
-                  // Picking a suggestion is authoritative: store the
-                  // Photon label as the address. Fall back to the city
-                  // or postcode if Photon somehow returns an empty
-                  // label, so the input never goes blank.
                   setDraft((d) => {
                     if (!d) return d
                     const resolved =
@@ -639,10 +657,11 @@ function LocationsView({
                   setGeocodeNote('Coordinates resolved.')
                 }}
                 placeholder="123 Main St, City, Country"
+                suggestionsEnabled={!frozen}
               />
             </Field>
 
-            {needsCoords && (
+            {needsCoords && !frozen && (
               <button
                 type="button"
                 onClick={geocodeAddress}
@@ -662,12 +681,45 @@ function LocationsView({
             )}
 
             <Field label="Coordinates (resolved from address)">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-600">
-                {draft.latitude && draft.longitude
-                  ? `${draft.latitude}, ${draft.longitude}`
+              <div className={`rounded-lg border px-3 py-2 font-mono text-xs ${
+                frozen
+                  ? 'border-slate-300 bg-slate-100 text-slate-700'
+                  : 'border-slate-200 bg-slate-50 text-slate-600'
+              }`}>
+                {hasCoords
+                  ? `${draft!.latitude}, ${draft!.longitude}`
                   : 'Not geocoded yet — pick a suggestion above.'}
               </div>
             </Field>
+
+            <label className="flex items-start gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={frozen}
+                onChange={(e) => {
+                  setFrozen(e.target.checked)
+                  // Restore the resolved-note when unfreezing so the state
+                  // of the coords is visible again.
+                  if (!e.target.checked && hasCoords) {
+                    setGeocodeNote('Coordinates resolved.')
+                  }
+                }}
+                disabled={!hasCoords}
+                className="mt-0.5"
+              />
+              <span className="text-slate-600">
+                <span className="font-medium">Freeze coordinates</span> and edit
+                the address manually — for when Photon's data doesn't match
+                reality (missing house numbers, wrong side of the street).
+                The frozen point is used for distance ranking; the typed
+                address is what the customer sees.
+                {!hasCoords && (
+                  <span className="mt-1 block text-amber-700">
+                    Resolve coordinates first (pick a suggestion above).
+                  </span>
+                )}
+              </span>
+            </label>
 
             <Field label="Description">
               <textarea
@@ -680,11 +732,7 @@ function LocationsView({
 
             <div className="flex justify-end gap-2 pt-2">
               <button
-                onClick={() => {
-                  setDraft(null)
-                  setGeocodeErr(null)
-                  setGeocodeNote(null)
-                }}
+                onClick={closeDraft}
                 className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
               >
                 Cancel

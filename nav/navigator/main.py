@@ -88,7 +88,7 @@ def create_app(settings: Settings) -> FastAPI:
     init_engine(settings)
     interviews.bind_settings(settings)
 
-    app = FastAPI(title="Local Resource Navigator", version="0.1.0")
+    app = FastAPI(title="Local Resource Navigator", version="0.2.0")
 
     @app.on_event("startup")
     async def _create_schema():
