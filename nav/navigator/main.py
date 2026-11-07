@@ -14,7 +14,9 @@ from sqlalchemy import delete as sa_delete, select, text
 from .config import Settings
 from .db import get_engine, get_sessionmaker, init_engine
 from .models import Base, InterviewSession
+from .ai.registry import reload_registry
 from .routers import (
+    admin,
     exports,
     interviews,
     locations,
@@ -87,6 +89,7 @@ async def _http_get(url: str, timeout: float = 2.0) -> tuple[int, bytes]:
 def create_app(settings: Settings) -> FastAPI:
     init_engine(settings)
     interviews.bind_settings(settings)
+    admin.bind_settings(settings)
 
     app = FastAPI(title="Local Resource Navigator", version="0.2.0")
 
@@ -100,6 +103,12 @@ def create_app(settings: Settings) -> FastAPI:
             # but must be identical on every replica.
             await conn.execute(text("SELECT pg_advisory_xact_lock(920110)"))
             await conn.run_sync(Base.metadata.create_all)
+
+        # Populate the model registry (hardcoded -> env -> DB).
+        # Admin routes refresh this after every write, so this only
+        # runs at process start.
+        async with get_sessionmaker()() as db:
+            await reload_registry(db, settings)
 
         # One-time sweep at startup so restarts don't leave orphans lying around.
         purged = await _purge_expired_sessions()
@@ -321,6 +330,11 @@ def create_app(settings: Settings) -> FastAPI:
         exports.router,
     ):
         app.include_router(r, prefix="/api")
+
+    # Admin routes carry their own /admin-api prefix and are NOT under
+    # /api. nav-ui's nginx never proxies this path, so they are
+    # reachable only through nav-admin's nginx.
+    app.include_router(admin.router)
 
     return app
 

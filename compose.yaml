@@ -68,10 +68,34 @@ services:
       # (commonly 172.17.0.1).
       NAVIGATOR_OLLAMA_ENDPOINT: "http://host.docker.internal:11434"
 
-      # gemma4:cloud and beam:cloud are Ollama Cloud tags. If your
-      # external Ollama is signed in to Ollama Cloud, these just work.
-      NAVIGATOR_OLLAMA_MODEL: "gemma4:cloud"
-      NAVIGATOR_FINAL_MODEL: "nemotron-3-ultra:cloud"
+      # ── Model registry seeds (env tier) ──────────────────
+      # Layered under the database; DB wins per-id. Editing models
+      # via /admin (nav-admin on :8008) writes DB overrides and takes
+      # effect immediately. These seeds are what a fresh deploy sees
+      # on first boot before any admin action.
+      #
+      # Endpoints point at host.docker.internal — the hardcoded dev
+      # defaults in ai/registry.py use 127.0.0.1, which inside the
+      # container is the container itself.
+      NAVIGATOR_MODELS_JSON: >-
+        [
+          {"id":"ollama-gemma4-cloud","module":"ollama","endpoint":"http://host.docker.internal:11434","model":"gemma4:cloud","context_window":256000,"max_output_tokens":8192,"label":"Gemma 4 (Ollama Cloud)"},
+          {"id":"ollama-local","module":"ollama","endpoint":"http://host.docker.internal:11434","model":"gemma2:2b","context_window":8192,"max_output_tokens":2048,"label":"Ollama local (gemma2:2b)"}
+        ]
+      NAVIGATOR_DEFAULT_CHAT_MODEL_ID: "ollama-gemma4-cloud"
+      NAVIGATOR_DEFAULT_FINALIZE_MODEL_ID: "ollama-gemma4-cloud"
+
+      # Deprecated: chat and finalize route through the model registry
+      # now (see nav/navigator/ai/registry.py). Kept commented for
+      # operators upgrading from an older compose file.
+      # NAVIGATOR_OLLAMA_MODEL: "gemma4:cloud"
+      # NAVIGATOR_FINAL_MODEL: "nemotron-3-ultra:cloud"
+
+      # ── Admin ────────────────────────────────────────────
+      # Bearer token for /admin-api/*. Required for nav-admin
+      # (running on :8008) to work. Rotate by changing this and
+      # restarting the nav container.
+      NAVIGATOR_ADMIN_TOKEN: "${NAVIGATOR_ADMIN_TOKEN:-dev-admin-token-change-me}"
 
     depends_on:
       postgres:
@@ -109,6 +133,16 @@ services:
     build: ./nav-ui
     ports: ["80:80"]
     depends_on: [nav]
+
+  # ── Admin UI ─────────────────────────────────────────────
+  # Protected by NAVIGATOR_ADMIN_TOKEN (bearer). Reachable on :8008
+  # only through this container's nginx — public nav-ui's nginx does
+  # not proxy /admin-api/*, so this frontend is the only path in.
+  nav-admin:
+    build: ./nav-admin
+    ports: ["8008:80"]
+    depends_on: [nav]
+    restart: unless-stopped
 
 volumes:
   pgdata:

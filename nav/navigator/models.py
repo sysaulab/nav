@@ -365,6 +365,31 @@ class LiveOccupancy(Base):
     )
 
 
+
+
+# ── Global key/value settings ────────────────────────────
+#
+# One row per operator-tunable knob. Source of truth for the model
+# registry (``model.<id>``), the default model ids (``default.chat``,
+# ``default.finalize``), and any future override.
+#
+# Why a KV table instead of columns: ``create_all()`` adds tables on
+# upgrade but never ALTERs them. A new knob is a new key, not a new
+# column, so schema creation stays a no-op across releases. The
+# value is JSON so structured specs are possible without a schema
+# change either.
+
+class AppSetting(Base):
+    __tablename__ = "app_setting"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+
+
+
+
 # ── Interview sessions & documents ──────────────────────
 
 class InterviewSession(Base):

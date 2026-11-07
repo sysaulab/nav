@@ -98,6 +98,8 @@ from ..schemas import (
     SkippedDocumentOut,
 )
 from ..tokens import estimate_tokens
+from ..ai.base import ChatEvent, ModelSpec
+from ..ai.registry import client_for, get_registry
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
 
@@ -746,6 +748,122 @@ def _card_payload(
         },
     }
 
+def _wire_delta(text: str) -> bytes:
+    """Emit one content chunk in the wire format nav-ui's parser expects.
+
+    nav-ui reads ``obj.message.content`` — an Ollama-shaped envelope.
+    Keeping that envelope lets us swap the backend (Ollama, OpenAI,
+    anything else behind ChatClient) without touching the browser.
+    """
+    return (json.dumps({"message": {"content": text}}) + "\n").encode()
+
+
+def _wire_card(card: dict) -> bytes:
+    return (json.dumps({
+        "event": "service_card",
+        "index": card["index"],
+        "service": card["service"],
+    }) + "\n").encode()
+
+
+def _wire_error(message: str) -> bytes:
+    return (json.dumps({"error": message}) + "\n").encode()
+
+
+def _stream_with_tools(
+    spec: ModelSpec,
+    messages: list[dict],
+    tools: list[dict],
+    *,
+    db: AsyncSession,
+    sess: InterviewSession,
+) -> StreamingResponse:
+    """Agent loop over a ChatClient.
+
+    Content streams to the client as it arrives. Tool calls run
+    server-side; their results feed back into the message list, and
+    the loop asks the model again until it stops calling tools or
+    hits MAX_TOOL_ROUNDS. Every yielded card is de-duplicated per
+    round so a single model turn cannot emit the same card twice.
+    """
+
+    async def stream():
+        client = client_for(spec)
+        for _round in range(MAX_TOOL_ROUNDS):
+            tool_events: list[ChatEvent] = []
+            assistant_text = ""
+            errored = False
+
+            async for ev in client.stream_chat(spec, messages, tools=tools):
+                if ev.kind == "delta" and ev.text:
+                    assistant_text += ev.text
+                    yield _wire_delta(ev.text)
+                elif ev.kind == "tool":
+                    tool_events.append(ev)
+                elif ev.kind == "done":
+                    break
+                elif ev.kind == "error":
+                    yield _wire_error(ev.error or "unknown model error")
+                    errored = True
+                    break
+
+            if errored:
+                return
+            if not tool_events:
+                return
+
+            messages.append({
+                "role": "assistant",
+                "content": assistant_text,
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": t.tool_name,
+                            "arguments": t.tool_arguments or {},
+                        },
+                    }
+                    for t in tool_events
+                ],
+            })
+
+            emitted_cards: set[int] = set()
+            for t in tool_events:
+                if t.tool_name == "get_service_details":
+                    text, card = await _execute_get_service_details(
+                        (t.tool_arguments or {}).get("index"), sess, db,
+                    )
+                    if card is not None and card["index"] not in emitted_cards:
+                        emitted_cards.add(card["index"])
+                        yield _wire_card(card)
+                    messages.append({"role": "tool", "content": text})
+                else:
+                    messages.append({
+                        "role": "tool",
+                        "content": f"unknown tool: {t.tool_name}",
+                    })
+
+        yield _wire_error("tool loop exceeded max rounds")
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+def _stream_simple(
+    spec: ModelSpec, messages: list[dict],
+) -> StreamingResponse:
+    """Single-pass streaming, no tools. Used by /finalize."""
+
+    async def stream():
+        client = client_for(spec)
+        async for ev in client.stream_chat(spec, messages):
+            if ev.kind == "delta" and ev.text:
+                yield _wire_delta(ev.text)
+            elif ev.kind == "error":
+                yield _wire_error(ev.error or "unknown model error")
+                return
+            elif ev.kind == "done":
+                return
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 async def _execute_get_service_details(
     index_arg, sess: InterviewSession, db: AsyncSession,
@@ -1015,20 +1133,18 @@ async def chat(
 ):
     sess = await _require_active(sid, request, db)
     await _require_located(sess)
-    cfg = _cfg()
+    spec = get_registry().default_chat()
+
     system_prompt, _included, _skipped, _used = await _build_chat_context(sid, db)
 
-    # Client messages are restricted to user/assistant; the system prompt is
-    # always ours, so a client-supplied system message would collide.
-    messages = [{"role": "system", "content": system_prompt}]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     for m in payload.messages:
         if m.role in ("user", "assistant"):
             messages.append({"role": m.role, "content": m.content})
 
-    await _preflight_ollama(cfg)
-    return _stream_ollama_with_tools(
-        cfg, cfg.ollama_model, messages, [TOOL_SCHEMA],
-        db=db, sess=sess, timeout=cfg.ollama_timeout_s,
+    return _stream_with_tools(
+        spec, messages, [TOOL_SCHEMA],
+        db=db, sess=sess,
     )
 
 # ── final plan ───────────────────────────────────────────
@@ -1039,7 +1155,7 @@ FINALIZE_SYSTEM_PROMPT = (
     "Below are their documents, the services near their postal code, and the "
     "conversation so far.\n\n"
     "Produce, in this order:\n"
-    "1. A 2–3 sentence summary of the situation.\n"
+    "1. A 2-3 sentence summary of the situation.\n"
     "2. Numbered, prioritized next steps (do first → do later).\n"
     "3. Specific referrals to nearby services — cite by name and location, "
     "using ONLY services from the 'Nearby services' list. If none fit, say so.\n"
@@ -1059,7 +1175,7 @@ async def finalize(
 ):
     sess = await _require_active(sid, request, db)
     await _require_located(sess)
-    cfg = _cfg()
+    spec = get_registry().default_finalize()
 
     system_prompt, _included, _skipped, _used = await _build_chat_context(
         sid, db, base=FINALIZE_SYSTEM_PROMPT
@@ -1074,5 +1190,4 @@ async def finalize(
         "content": "Please produce the final action plan and referrals now.",
     })
 
-    await _preflight_ollama(cfg)
-    return _stream_ollama(cfg, cfg.final_model, messages, cfg.final_timeout_s)
+    return _stream_simple(spec, messages)
