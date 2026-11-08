@@ -1,18 +1,3 @@
-"""Interview session + document upload + chat orchestration.
-
-  POST   /interviews                        → create-or-resume active session
-  GET    /interviews/active                 → current active session or null
-  DELETE /interviews/{sid}                  → end session (cascade deletes docs)
-  POST   /interviews/{sid}/location         → set postal code, geocode, unlock chat
-  GET    /interviews/{sid}/location         → current session origin
-  POST   /interviews/{sid}/documents        → upload → sanitize → filter → store
-  GET    /interviews/{sid}/documents        → list metadata (no payloads)
-  GET    /interviews/{sid}/documents/{did}  → full filtered payload (preview)
-  DELETE /interviews/{sid}/documents/{did}
-  GET    /interviews/{sid}/context-prompt   → preview assembled system prompt
-  POST   /interviews/{sid}/chat             → proxy chat to Ollama (NDJSON stream)
-  POST   /interviews/{sid}/finalize         → stream final plan from `final_model`
-"""
 from __future__ import annotations
 
 import json
@@ -74,7 +59,6 @@ def _set_session_cookie(response: Response, sid: UUID) -> None:
         httponly=True,
         samesite="lax",
         path="/",
-        # secure=True,  # enable when serving over HTTPS
     )
 
 from fastapi.responses import StreamingResponse
@@ -97,13 +81,12 @@ from ..schemas import (
     SessionLocationOut,
     SkippedDocumentOut,
 )
-from ..tokens import estimate_tokens
+from ..tokens import estimate_tokens, estimate_chat_tokens
 from ..ai.base import ChatEvent, ModelSpec
 from ..ai.registry import client_for, get_registry
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
 
-# Populated by main.create_app(settings).
 _settings: Settings | None = None
 
 
@@ -129,7 +112,6 @@ async def _require_active(
     sess = await db.get(InterviewSession, sid)
     if sess is None:
         raise HTTPException(404, "session not found")
-    # The session id is a bearer token; require it to match the visitor's cookie.
     if _read_session_cookie(request) != sid:
         raise HTTPException(404, "session not found")
     if sess.status == "ended":
@@ -139,7 +121,6 @@ async def _require_active(
         sess.status = "expired"
         await db.commit()
         raise HTTPException(410, "session expired")
-    # Sliding window: every authenticated request extends the idle deadline.
     sess.expires_at = now + timedelta(minutes=_cfg().session_idle_minutes)
     await db.commit()
     return sess
@@ -169,7 +150,6 @@ async def create_or_resume_session(
             await db.commit()
             await db.refresh(sess)
             return sess
-        # Cookie points at a dead session — delete it and mint a new one.
         if sess is not None:
             await db.execute(sa_delete(InterviewSession).where(InterviewSession.id == sess.id))
             await db.commit()
@@ -239,16 +219,10 @@ async def set_location(
     cfg = _cfg()
 
     if payload.lat is not None and payload.lng is not None:
-        # Client picked a candidate from /api/geocode/search — trust it,
-        # skip the round-trip to Photon. display_name is the full label
-        # the client already has in hand.
         lat = payload.lat
         lng = payload.lng
         display_name = payload.display_name or payload.postal_code
     else:
-        # Free-text fallback (Enter without a candidate). Photon handles
-        # typos; its response is GeoJSON with flat property fields, so we
-        # build the display label from those.
         endpoint = cfg.photon_endpoint.rstrip("/")
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -289,9 +263,6 @@ async def set_location(
     sess.origin_lng = lng
     sess.origin_display_name = display_name[:512]
 
-    # Rebuild the index in distance order. Both fields reset together so
-    # `[07]` never means a different service before and after a location
-    # change.
     rows = await _nearby_services(
         db, lat, lng, cfg.postcode_radius_km,
         cfg.nearby_location_limit, cfg.nearby_index_limit,
@@ -354,8 +325,6 @@ async def upload_document(
 
     filename = file.filename or "upload"
 
-    # Forward to the sanitizer. Its _ingest_lock serializes concurrent calls;
-    # we make no attempt to serialize at this layer.
     try:
         async with httpx.AsyncClient(timeout=cfg.sanitizer_timeout_s) as client:
             resp = await client.post(
@@ -442,7 +411,7 @@ async def remove_document(
 
 # ── nearby services ──────────────────────────────────────
 _EARTH_R_KM = 6371.0088
-_DEG_PER_KM = 1.0 / 111.0   # rough; only used to widen the SQL bbox
+_DEG_PER_KM = 1.0 / 111.0
 
 
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -459,12 +428,6 @@ async def _closest_location_per_service(
     origin_lat: float,
     origin_lng: float,
 ) -> dict[UUID, tuple[Location, float]]:
-    """Return {service_id: (closest_location, distance_km)}.
-
-    Mirrors the dedupe rule in `_nearby_services`: if a service is at
-    multiple locations, downstream rendering must agree with the location
-    the prompt actually listed it under.
-    """
     if not service_ids:
         return {}
     loc_rows = (await db.execute(
@@ -484,6 +447,7 @@ async def _closest_location_per_service(
             result[sal_sid] = (loc, d)
     return result
 
+
 async def _nearby_services(
     db: AsyncSession,
     lat: Decimal,
@@ -492,17 +456,6 @@ async def _nearby_services(
     location_limit: int,
     index_limit: int,
 ) -> list[tuple[Service, Location, float]]:
-    """Return (service, location, km) grouped by location, nearest first.
-
-    A service that exists at multiple locations is kept only once, at its
-    closest location. The flat list preserves location grouping by order
-    — consecutive items share a location — so the prompt renderer does
-    not need to group again.
-
-    SQL prefilter is a square bbox (fast, index-friendly); the haversine
-    filter and sort happen in Python. The bbox is deliberately generous —
-    it only has to be a superset of the true circle.
-    """
     lat0, lng0 = float(lat), float(lng)
     deg_pad = radius_km * _DEG_PER_KM
     stmt = (
@@ -519,7 +472,6 @@ async def _nearby_services(
     )
     rows = (await db.execute(stmt)).all()
 
-    # Closest location per service.
     by_service: dict[UUID, tuple[Service, Location, float]] = {}
     for svc, loc in rows:
         if loc.latitude is None or loc.longitude is None:
@@ -531,7 +483,6 @@ async def _nearby_services(
         if prev is None or d < prev[2]:
             by_service[svc.id] = (svc, loc, d)
 
-    # Group by location.
     by_location: dict[UUID, tuple[Location, float, list[Service]]] = {}
     for svc, loc, d in by_service.values():
         entry = by_location.get(loc.id)
@@ -540,10 +491,8 @@ async def _nearby_services(
         else:
             entry[2].append(svc)
 
-    # Nearest locations first, capped.
     sorted_locs = sorted(by_location.values(), key=lambda t: t[1])[:location_limit]
 
-    # Flatten — services within a location sorted by name for determinism.
     result: list[tuple[Service, Location, float]] = []
     for loc, d, svcs in sorted_locs:
         for svc in sorted(svcs, key=lambda s: (s.name or "").lower()):
@@ -568,7 +517,6 @@ _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 
 def _category_of(svc: Service) -> str:
-    """Placeholder classifier — Service.name only, swapped for a real column later."""
     text = (svc.name or "").lower()
     for cat, keys in _CATEGORY_KEYWORDS.items():
         if any(k in text for k in keys):
@@ -620,12 +568,11 @@ def _render_nearby(
     current_loc_id: UUID | None = None
     for idx, svc, loc, dist in items:
         if loc is None:
-            # Service row was deleted mid-session; keep the index stable.
             lines.append(f"[{idx:02d}] (no longer available)")
             continue
         if loc.id != current_loc_id:
             if current_loc_id is not None:
-                lines.append("")  # blank line between locations
+                lines.append("")
             name = loc.name or "(unnamed location)"
             lines.append(f"{name} ({dist:.1f}km away)")
             if loc.address:
@@ -655,8 +602,7 @@ def _render_nearby(
 
 
 def _parse_index(raw) -> int | None:
-    """Accept 17, "17", "017", "[17]", "(17)". Out-of-scope → None."""
-    if isinstance(raw, bool):  # bool is an int subclass; reject defensively
+    if isinstance(raw, bool):
         return None
     if isinstance(raw, int):
         return raw
@@ -688,10 +634,6 @@ async def _lookup_location_and_distance(
 async def _fetch_nearby_by_ids(
     db: AsyncSession, ids: list[str], sess: InterviewSession,
 ) -> list[tuple[int, Service | None, Location | None, float]]:
-    """Return a list aligned to `ids` (index → service). Missing services are
-    kept as `(idx, None, None, 0.0)` so the LLM's index → service mapping
-    stays stable even if a row is deleted mid-session.
-    """
     if not ids:
         return []
 
@@ -726,6 +668,7 @@ async def _fetch_nearby_by_ids(
         out.append((idx, svc, loc, dist))
     return out
 
+
 def _card_payload(
     idx: int, svc: Service, loc: Location | None, dist_km: float,
 ) -> dict:
@@ -748,13 +691,182 @@ def _card_payload(
         },
     }
 
-def _wire_delta(text: str) -> bytes:
-    """Emit one content chunk in the wire format nav-ui's parser expects.
 
-    nav-ui reads ``obj.message.content`` — an Ollama-shaped envelope.
-    Keeping that envelope lets us swap the backend (Ollama, OpenAI,
-    anything else behind ChatClient) without touching the browser.
-    """
+async def _execute_get_service_details(
+    index_arg, sess: InterviewSession, db: AsyncSession,
+) -> tuple[str, dict | None]:
+    idx = _parse_index(index_arg)
+    if idx is None:
+        return "error: index must be an integer like 17 or [17]", None
+
+    ids = sess.nearby_service_ids or []
+    if not ids:
+        return "error: no nearby services available for this session", None
+    if idx < 0 or idx >= len(ids):
+        return (
+            f"error: index {idx} out of range; the list has {len(ids)} entries",
+            None,
+        )
+    try:
+        svc_uuid = UUID(ids[idx])
+    except ValueError:
+        return f"error: malformed id at index {idx}", None
+
+    svc = await db.get(Service, svc_uuid)
+    if svc is None:
+        return f"error: service at index {idx} no longer exists", None
+
+    loc, dist = await _lookup_location_and_distance(db, svc, sess)
+    text = _render_service_full(idx, svc, loc, dist)
+    card = _card_payload(idx, svc, loc, dist)
+
+    revealed = set(sess.revealed_service_indices or [])
+    if idx not in revealed:
+        revealed.add(idx)
+        sess.revealed_service_indices = sorted(revealed)
+        await db.commit()
+
+    return text, card
+
+
+# ── context assembly ─────────────────────────────────────
+
+def _render_session_context(sess: InterviewSession) -> str:
+    started = sess.created_at
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    local = started.astimezone()
+
+    day = local.day
+    suffix = (
+        "th" if 11 <= day <= 13
+        else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    )
+    date_str = f"{local.strftime('%A, %B')} {day}{suffix}, {local.year}"
+
+    hour = local.hour
+    if 5 <= hour < 12:
+        period = "morning"
+    elif 12 <= hour < 17:
+        period = "afternoon"
+    elif 17 <= hour < 21:
+        period = "evening"
+    else:
+        period = "night"
+
+    tz_label = local.strftime("%Z") or "UTC"
+    time_str = local.strftime("%H:%M")
+
+    return (
+        f"## Session context\n"
+        f"Today is {date_str}. The conversation started at "
+        f"{time_str} {tz_label} ({period}). Some time may have passed "
+        f"since then."
+    )
+
+
+async def _build_chat_context(
+    sid: UUID, db: AsyncSession, base: str = BASE_SYSTEM_PROMPT
+):
+    cfg = _cfg()
+    sess = await db.get(InterviewSession, sid)
+    docs = (await db.execute(
+        select(SessionDocument)
+        .where(SessionDocument.session_id == sid)
+        .order_by(SessionDocument.created_at)
+    )).scalars().all()
+
+    included: list[SessionDocument] = []
+    skipped: list[dict] = []
+    used = 0
+
+    for doc in docs:
+        if doc.status != "ready":
+            skipped.append({
+                "id": doc.id,
+                "filename": doc.filename,
+                "reason": doc.skip_reason or doc.status,
+                "token_estimate": doc.token_estimate,
+            })
+            continue
+        if used + doc.token_estimate <= cfg.document_budget_tokens:
+            included.append(doc)
+            used += doc.token_estimate
+        else:
+            skipped.append({
+                "id": doc.id,
+                "filename": doc.filename,
+                "reason": "budget_exceeded",
+                "token_estimate": doc.token_estimate,
+                "remaining_budget": cfg.document_budget_tokens - used,
+            })
+
+    rendered = [render_document(json.loads(d.payload_json)) for d in included]
+
+    if sess is not None:
+        enriched_base = base + "\n\n" + _render_session_context(sess)
+    else:
+        enriched_base = base
+
+    system_prompt = assemble_prompt(enriched_base, rendered)
+
+    if sess and sess.origin_lat is not None and sess.origin_lng is not None:
+        items = await _fetch_nearby_by_ids(db, sess.nearby_service_ids or [], sess)
+        if not items:
+            rows = await _nearby_services(
+                db, sess.origin_lat, sess.origin_lng,
+                cfg.postcode_radius_km,
+                cfg.nearby_location_limit, cfg.nearby_index_limit,
+            )
+            sess.nearby_service_ids = [str(svc.id) for svc, _l, _d in rows]
+            await db.commit()
+            items = [
+                (i, svc, loc, d) for i, (svc, loc, d) in enumerate(rows)
+            ]
+        block = _render_nearby(
+            items,
+            sess.postal_code or "unknown",
+            sess.origin_display_name,
+            set(sess.revealed_service_indices or []),
+        )
+        system_prompt += "\n\n" + block
+        used += estimate_tokens(block, model_name=cfg.tokenizer_model)
+
+    return system_prompt, included, skipped, used
+
+
+@router.post("/{sid}/context-prompt", response_model=ContextPromptOut)
+async def get_context_prompt(
+    sid: UUID,
+    payload: ChatRequestIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_active(sid, request, db)
+    cfg = _cfg()
+    spec = get_registry().default_chat()
+    
+    system_prompt, included, skipped, _ = await _build_chat_context(sid, db)
+    
+    prompt_tokens = estimate_tokens(system_prompt, model_name=cfg.tokenizer_model)
+    
+    msgs = [{"role": m.role, "content": m.content} for m in payload.messages if m.role in ("user", "assistant")]
+    chat_tokens = estimate_chat_tokens(msgs, model_name=cfg.tokenizer_model)
+    
+    return ContextPromptOut(
+        system_prompt=system_prompt,
+        included=[DocumentMetaOut.model_validate(d) for d in included],
+        skipped=[SkippedDocumentOut(**s) for s in skipped],
+        total_tokens=prompt_tokens + chat_tokens,
+        budget_tokens=spec.budget_tokens,
+        context_window=spec.context_window,
+        output_reserve_tokens=spec.max_output_tokens,
+    )
+
+
+# ── chat proxy ───────────────────────────────────────────
+
+def _wire_delta(text: str) -> bytes:
     return (json.dumps({"message": {"content": text}}) + "\n").encode()
 
 
@@ -778,15 +890,6 @@ def _stream_with_tools(
     db: AsyncSession,
     sess: InterviewSession,
 ) -> StreamingResponse:
-    """Agent loop over a ChatClient.
-
-    Content streams to the client as it arrives. Tool calls run
-    server-side; their results feed back into the message list, and
-    the loop asks the model again until it stops calling tools or
-    hits MAX_TOOL_ROUNDS. Every yielded card is de-duplicated per
-    round so a single model turn cannot emit the same card twice.
-    """
-
     async def stream():
         client = client_for(spec)
         for _round in range(MAX_TOOL_ROUNDS):
@@ -850,8 +953,6 @@ def _stream_with_tools(
 def _stream_simple(
     spec: ModelSpec, messages: list[dict],
 ) -> StreamingResponse:
-    """Single-pass streaming, no tools. Used by /finalize."""
-
     async def stream():
         client = client_for(spec)
         async for ev in client.stream_chat(spec, messages):
@@ -865,330 +966,6 @@ def _stream_simple(
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
-async def _execute_get_service_details(
-    index_arg, sess: InterviewSession, db: AsyncSession,
-) -> tuple[str, dict | None]:
-    """Returns (tool_text_for_model, card_payload_or_None)."""
-    idx = _parse_index(index_arg)
-    if idx is None:
-        return "error: index must be an integer like 17 or [17]", None
-
-    ids = sess.nearby_service_ids or []
-    if not ids:
-        return "error: no nearby services available for this session", None
-    if idx < 0 or idx >= len(ids):
-        return (
-            f"error: index {idx} out of range; the list has {len(ids)} entries",
-            None,
-        )
-    try:
-        svc_uuid = UUID(ids[idx])
-    except ValueError:
-        return f"error: malformed id at index {idx}", None
-
-    svc = await db.get(Service, svc_uuid)
-    if svc is None:
-        return f"error: service at index {idx} no longer exists", None
-
-    loc, dist = await _lookup_location_and_distance(db, svc, sess)
-    text = _render_service_full(idx, svc, loc, dist)
-    card = _card_payload(idx, svc, loc, dist)
-
-    revealed = set(sess.revealed_service_indices or [])
-    if idx not in revealed:
-        revealed.add(idx)
-        sess.revealed_service_indices = sorted(revealed)
-        await db.commit()
-
-    return text, card
-
-
-# ── context assembly ─────────────────────────────────────
-
-
-def _render_session_context(sess: InterviewSession) -> str:
-    """Build a cache-stable timestamp block for the system prompt.
-
-    Uses sess.created_at (not now()) so the block is identical on every
-    turn and the KV cache survives document uploads — the divergence
-    point stays where documents begin, not at the timestamp.
-
-    Time-of-day is derived from the container's local timezone. Set
-    TZ=America/Vancouver (or similar) in compose.yaml for the period
-    descriptor ("morning"/"evening") to reflect the user's actual day.
-    Without TZ, this is UTC and the descriptor will be wrong for North
-    American users by 4–8 hours.
-    """
-    started = sess.created_at
-    if started.tzinfo is None:
-        # Defensive: Postgres timestamptz should never be naive. Treat
-        # naive as UTC so a future schema change can't silently shift
-        # the date shown to the model.
-        started = started.replace(tzinfo=timezone.utc)
-    local = started.astimezone()  # -> container's local timezone
-
-    day = local.day
-    suffix = (
-        "th" if 11 <= day <= 13
-        else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
-    )
-    date_str = f"{local.strftime('%A, %B')} {day}{suffix}, {local.year}"
-
-    hour = local.hour
-    if 5 <= hour < 12:
-        period = "morning"
-    elif 12 <= hour < 17:
-        period = "afternoon"
-    elif 17 <= hour < 21:
-        period = "evening"
-    else:
-        period = "night"
-
-    tz_label = local.strftime("%Z") or "UTC"
-    time_str = local.strftime("%H:%M")
-
-    return (
-        f"## Session context\n"
-        f"Today is {date_str}. The conversation started at "
-        f"{time_str} {tz_label} ({period}). Some time may have passed "
-        f"since then."
-    )
-
-
-
-
-async def _build_chat_context(
-    sid: UUID, db: AsyncSession, base: str = BASE_SYSTEM_PROMPT
-):
-    """Greedy oldest-first fill; near-by services appended as a block.
-
-    Returns (system_prompt, included, skipped, used_tokens). Skips (does not
-    stop at) documents that don't fit, so a large early doc doesn't block a
-    smaller later one.
-
-    The base prompt is enriched with a session-context block (date + start
-    time) before documents are assembled. This block is stable across the
-    whole session, so the KV cache survives turns and document uploads
-    with a common prefix.
-    """
-    cfg = _cfg()
-    sess = await db.get(InterviewSession, sid)
-    docs = (await db.execute(
-        select(SessionDocument)
-        .where(SessionDocument.session_id == sid)
-        .order_by(SessionDocument.created_at)
-    )).scalars().all()
-
-    included: list[SessionDocument] = []
-    skipped: list[dict] = []
-    used = 0
-
-    for doc in docs:
-        if doc.status != "ready":
-            skipped.append({
-                "id": doc.id,
-                "filename": doc.filename,
-                "reason": doc.skip_reason or doc.status,
-                "token_estimate": doc.token_estimate,
-            })
-            continue
-        if used + doc.token_estimate <= cfg.document_budget_tokens:
-            included.append(doc)
-            used += doc.token_estimate
-        else:
-            skipped.append({
-                "id": doc.id,
-                "filename": doc.filename,
-                "reason": "budget_exceeded",
-                "token_estimate": doc.token_estimate,
-                "remaining_budget": cfg.document_budget_tokens - used,
-            })
-
-    rendered = [render_document(json.loads(d.payload_json)) for d in included]
-
-    # Enrich the base prompt with the session context block. Appending
-    # (not prepending) keeps the "you are a caseworker" personality
-    # first; the date/time follows as situational context.
-    if sess is not None:
-        enriched_base = base + "\n\n" + _render_session_context(sess)
-    else:
-        enriched_base = base
-
-    system_prompt = assemble_prompt(enriched_base, rendered)
-
-    if sess and sess.origin_lat is not None and sess.origin_lng is not None:
-        items = await _fetch_nearby_by_ids(db, sess.nearby_service_ids or [], sess)
-        if not items:
-            # Index was never built (e.g. session created before this patch, or
-            # set_location interrupted). Build it lazily and persist.
-            rows = await _nearby_services(
-                db, sess.origin_lat, sess.origin_lng,
-                cfg.postcode_radius_km,
-                cfg.nearby_location_limit, cfg.nearby_index_limit,
-            )
-            sess.nearby_service_ids = [str(svc.id) for svc, _l, _d in rows]
-            await db.commit()
-            items = [
-                (i, svc, loc, d) for i, (svc, loc, d) in enumerate(rows)
-            ]
-        block = _render_nearby(
-            items,
-            sess.postal_code or "unknown",
-            sess.origin_display_name,
-            set(sess.revealed_service_indices or []),
-        )
-        system_prompt += "\n\n" + block
-        used += estimate_tokens(block, model_name=cfg.tokenizer_model)
-
-    return system_prompt, included, skipped, used
-
-
-@router.get("/{sid}/context-prompt", response_model=ContextPromptOut)
-async def get_context_prompt(
-    sid: UUID, request: Request, db: AsyncSession = Depends(get_db)
-):
-    await _require_active(sid, request, db)
-    cfg = _cfg()
-    system_prompt, included, skipped, used = await _build_chat_context(sid, db)
-    return ContextPromptOut(
-        system_prompt=system_prompt,
-        included=[DocumentMetaOut.model_validate(d) for d in included],
-        skipped=[SkippedDocumentOut(**s) for s in skipped],
-        total_tokens=used,
-        budget_tokens=cfg.document_budget_tokens,
-    )
-
-
-# ── chat proxy ───────────────────────────────────────────
-
-async def _preflight_ollama(cfg: Settings) -> None:
-    """Fail fast if ollama is down, so the client gets a 502 immediately."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as probe:
-            await probe.get(f"{cfg.ollama_endpoint}/api/tags")
-    except httpx.RequestError as e:
-        raise HTTPException(502, f"ollama unreachable: {e}")
-
-
-def _stream_ollama(cfg: Settings, model: str, messages: list[dict], timeout: float):
-    async def stream():
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream(
-                "POST",
-                f"{cfg.ollama_endpoint}/api/chat",
-                json={"model": model, "messages": messages, "stream": True},
-            ) as r:
-                if r.status_code >= 400:
-                    body = await r.aread()
-                    yield (
-                        json.dumps({"error": f"ollama {r.status_code}: {body[:200]!r}"})
-                        + "\n"
-                    ).encode()
-                    return
-                async for chunk in r.aiter_raw():
-                    yield chunk
-
-    return StreamingResponse(stream(), media_type="application/x-ndjson")
-
-def _err_line(message: str) -> bytes:
-    return (json.dumps({"error": message}) + "\n").encode()
-
-
-def _stream_ollama_with_tools(
-    cfg: Settings,
-    model: str,
-    messages: list[dict],
-    tools: list[dict],
-    *,
-    db: AsyncSession,
-    sess: InterviewSession,
-    timeout: float,
-):
-    """Agent loop: content streams to the client unchanged; tool results stay
-    server-side. The final answer's history is *not* re-sent next turn — the
-    revealed services get promoted into the system prompt by
-    `_build_chat_context` instead. That's the workaround for Gemma4's
-    tool-feedback quirk.
-    """
-
-    async def stream():
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            for _round in range(MAX_TOOL_ROUNDS):
-                tool_calls: list[dict] = []
-                assistant_text = ""
-                done = False
-
-                async with client.stream(
-                    "POST",
-                    f"{cfg.ollama_endpoint}/api/chat",
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "tools": tools,
-                        "stream": True,
-                        "options": {"num_ctx": 256_000},
-                    },
-                ) as r:
-                    if r.status_code >= 400:
-                        body = await r.aread()
-                        yield _err_line(f"ollama {r.status_code}: {body[:200]!r}")
-                        return
-
-                    async for line in r.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        msg = chunk.get("message", {}) or {}
-                        if msg.get("content"):
-                            assistant_text += msg["content"]
-                            yield (line + "\n").encode()
-                        if msg.get("tool_calls"):
-                            tool_calls.extend(msg["tool_calls"])
-                        if chunk.get("done"):
-                            done = True
-                            break
-
-                if not tool_calls:
-                    return  # normal completion
-                if not done:
-                    yield _err_line("ollama stream ended before done=true")
-                    return
-
-                messages.append({
-                    "role": "assistant",
-                    "content": assistant_text,
-                    "tool_calls": tool_calls,
-                })
-
-                emitted_cards: set[int] = set()
-                for tc in tool_calls:
-                    fn = (tc.get("function") or {}).get("name", "")
-                    args = (tc.get("function") or {}).get("arguments") or {}
-                    if fn == "get_service_details":
-                        text, card = await _execute_get_service_details(
-                            args.get("index"), sess, db,
-                        )
-                        if card is not None and card["index"] not in emitted_cards:
-                            emitted_cards.add(card["index"])
-                            yield (json.dumps({
-                                "event": "service_card",
-                                "index": card["index"],
-                                "service": card["service"],
-                            }) + "\n").encode()
-                        messages.append({"role": "tool", "content": text})
-                    else:
-                        messages.append({
-                            "role": "tool",
-                            "content": f"unknown tool: {fn}",
-                        })
-                # loop — ask the model again with the tool results in context
-
-            yield _err_line("tool loop exceeded max rounds")
-
-    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 @router.post("/{sid}/chat")
 async def chat(
@@ -1213,6 +990,7 @@ async def chat(
         db=db, sess=sess,
     )
 
+
 # ── final plan ───────────────────────────────────────────
 
 FINALIZE_SYSTEM_PROMPT = (
@@ -1221,7 +999,7 @@ FINALIZE_SYSTEM_PROMPT = (
     "Below are their documents, the services near their postal code, and the "
     "conversation so far.\n\n"
     "Produce, in this order:\n"
-    "1. A 2-3 sentence summary of the situation.\n"
+    "1. A 2–3 sentence summary of the situation.\n"
     "2. Numbered, prioritized next steps (do first → do later).\n"
     "3. Specific referrals to nearby services — cite by name and location, "
     "using ONLY services from the 'Nearby services' list. If none fit, say so.\n"

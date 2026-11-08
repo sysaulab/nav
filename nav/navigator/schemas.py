@@ -150,6 +150,8 @@ class ContextPromptOut(_Out):
     skipped: list[SkippedDocumentOut]
     total_tokens: int
     budget_tokens: int
+    context_window: int
+    output_reserve_tokens: int
 
 
 class ChatMessageIn(_In):

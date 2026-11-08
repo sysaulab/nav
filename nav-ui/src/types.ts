@@ -128,6 +128,8 @@ export interface ContextPrompt {
   skipped: SkippedDocument[]
   total_tokens: number
   budget_tokens: number
+  context_window: number
+  output_reserve_tokens: number
 }
 
 export interface ChatMessage {

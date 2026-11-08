@@ -53,3 +53,20 @@ def estimate_tokens(payload: Any, *, model_name: str = "google/gemma-2-2b-it") -
             log.warning("tokenizer.encode_failed err=%s — char heuristic", e)
     # Conservative: 3.5 chars/token (JSON is denser than prose).
     return max(1, int(len(text) / 3.5))
+
+def estimate_chat_tokens(messages: list[dict], model_name: str = "google/gemma-2-2b-it") -> int:
+    """Estimate tokens for a chat conversation, including overhead."""
+    tok = _load(model_name)
+    if tok is not None and getattr(tok, "chat_template", None):
+        try:
+            ids = tok.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=True,
+            )
+            return len(ids)
+        except Exception:
+            pass
+    # Fallback: ~4 tok overhead per message + content estimate.
+    total = 0
+    for m in messages:
+        total += 4 + estimate_tokens(m.get("content", ""), model_name=model_name)
+    return total

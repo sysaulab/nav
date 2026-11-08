@@ -10,6 +10,13 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * True for the three states the backend uses to say "this session is gone":
+ *   410  session expired (idle TTL elapsed)
+ *   409  session has ended (status == "ended", defensive)
+ *   404  session not found (cookie cleared, or purge already ran)
+ * All three should route the user back to /interview to mint a fresh session.
+ */
 export function isSessionError(err: unknown): boolean {
   if (!(err instanceof ApiError)) return false
   const d = err.detail.toLowerCase()
@@ -21,6 +28,7 @@ export function isSessionError(err: unknown): boolean {
   )
 }
 
+// ── request observability ─────────────────────────────────
 type RequestListener = (sentAtMs: number) => void
 let requestListeners: RequestListener[] = []
 
@@ -34,7 +42,11 @@ export function onRequest(fn: RequestListener): () => void {
 function notifyRequestSent() {
   const t = Date.now()
   for (const f of requestListeners) {
-    try { f(t) } catch { /* ignore */ }
+    try {
+      f(t)
+    } catch {
+      /* a listener must never break a request */
+    }
   }
 }
 
@@ -54,6 +66,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
+// Multipart upload with progress. XHR because `fetch` cannot report upload
+// progress. Never sets Content-Type — the browser sets the multipart boundary.
 function uploadMultipart<T>(
   path: string,
   file: File,
@@ -87,6 +101,7 @@ function uploadMultipart<T>(
   })
 }
 
+// Shared NDJSON stream reader. Used by both chat and finalize.
 async function streamNdjson(
   path: string,
   messages: import('./types').ChatMessage[],
@@ -112,7 +127,9 @@ async function streamNdjson(
       if (!line.trim()) continue
       try {
         onChunk(JSON.parse(line))
-      } catch { /* skip malformed line */ }
+      } catch {
+        /* skip malformed line */
+      }
     }
   }
 }
@@ -129,7 +146,15 @@ export const api = {
     ),
   health: {
     maestro: () =>
-      request<{ status: string; service: string; version: string }>('/health'),
+      request<{
+        status: string
+        service: string
+        version: string
+        ingest_server: string
+        geocoder: string
+        ollama: string
+        model: string
+      }>('/health'),
     ingest: () =>
       request<{ ok: boolean; endpoint: string; error?: string }>('/health/ingest'),
     geocoder: () =>
@@ -141,6 +166,8 @@ export const api = {
     sql: () =>
       request<{ ok: boolean; backend: string; error?: string }>('/health/sql'),
   },
+
+  // ── interview ─────────────────────────────────────────
   interviews: {
     createOrResume: () =>
       request<import('./types').InterviewSession>('/interviews', { method: 'POST' }),
@@ -148,6 +175,7 @@ export const api = {
       request<import('./types').InterviewSession | null>('/interviews/active'),
     end: (sid: string) =>
       request<void>(`/interviews/${sid}`, { method: 'DELETE' }),
+
     location: (sid: string) =>
       request<import('./types').SessionLocation>(`/interviews/${sid}/location`),
     setLocation: (
@@ -163,8 +191,13 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(payload),
       }),
-    contextPrompt: (sid: string) =>
-      request<import('./types').ContextPrompt>(`/interviews/${sid}/context-prompt`),
+
+    contextPrompt: (sid: string, messages: import('./types').ChatMessage[]) =>
+      request<import('./types').ContextPrompt>(`/interviews/${sid}/context-prompt`, {
+        method: 'POST',
+        body: JSON.stringify({ messages }),
+      }),
+
     documents: {
       list: (sid: string) =>
         request<import('./types').DocumentMeta[]>(`/interviews/${sid}/documents`),
@@ -177,11 +210,13 @@ export const api = {
       remove: (sid: string, did: string) =>
         request<void>(`/interviews/${sid}/documents/${did}`, { method: 'DELETE' }),
     },
+
     chat: (
       sid: string,
       messages: import('./types').ChatMessage[],
       onChunk: (obj: unknown) => void,
     ) => streamNdjson(`/interviews/${sid}/chat`, messages, onChunk),
+
     finalize: (
       sid: string,
       messages: import('./types').ChatMessage[],

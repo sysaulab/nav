@@ -20,7 +20,7 @@ type Upload = { id: string; filename: string; pct: number }
 
 export default function Interview() {
   const navigate = useNavigate()
-  const { clearPin } = usePrivacy()
+  const { unlock } = usePrivacy()
   const [session, setSession] = useState<InterviewSession | null>(null)
   const [docs, setDocs] = useState<DocumentMeta[]>([])
   const [context, setContext] = useState<ContextPrompt | null>(null)
@@ -51,14 +51,11 @@ export default function Interview() {
     return false
   }, [])
 
-
-  
-  // ── bootstrap ─────────────────────────────────────────
-  const refresh = useCallback(async (sid: string) => {
+  const refresh = useCallback(async (sid: string, messages: ChatMessage[] = []) => {
     try {
       const [d, c] = await Promise.all([
         api.interviews.documents.list(sid),
-        api.interviews.contextPrompt(sid),
+        api.interviews.contextPrompt(sid, messages),
       ])
       setDocs(d)
       setContext(c)
@@ -121,107 +118,116 @@ export default function Interview() {
 
     void init()
     return () => { live = false }
-  }, [])
+  }, []) // <-- Added missing dependency array here
+
+  // ── update context bar when chat/session changes ──────
+  useEffect(() => {
+    if (!session || streaming) return
+    const messages = chat
+      .filter((i): i is Extract<ChatItem, { kind: 'message' }> => i.kind === 'message')
+      .map((i) => ({ role: i.role, content: i.content }))
+    api.interviews.contextPrompt(session.id, messages)
+      .then(setContext)
+      .catch(() => {})
+  }, [chat, session, streaming]) // <-- Moved out of the bootstrap effect
 
   // ── upload ────────────────────────────────────────────
-const ACCEPT =
-  '.rtf,.pdf,.txt,.md,.docx,.odt,.ods,.odp,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
+  const ACCEPT =
+    '.rtf,.pdf,.txt,.md,.docx,.odt,.ods,.odp,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
 
-const BLOCKED_LEGACY: Record<string, string> = {
-  '.doc': '.docx',
-  '.xls': '.xlsx',
-  '.ppt': '.pptx',
-}
-
-function legacyOfficeHint(filename: string): string | null {
-  const i = filename.lastIndexOf('.')
-  if (i < 0) return null
-  const ext = filename.slice(i).toLowerCase()
-  const replacement = BLOCKED_LEGACY[ext]
-  return replacement
-    ? `${filename}: ${ext} (Office 97-2003) is not supported — re-save as ${replacement} and re-upload.`
-    : null
-}
-
-async function verifyExpired() {
-  if (!session) return
-  try {
-    // Any authenticated GET refreshes the server deadline. If it succeeds,
-    // the deadline slides and the pill disappears on the next tick.
-    await api.interviews.location(session.id)
-  } catch (e) {
-    if (isSessionError(e)) setSessionExpired(true)
+  const BLOCKED_LEGACY: Record<string, string> = {
+    '.doc': '.docx',
+    '.xls': '.xlsx',
+    '.ppt': '.pptx',
   }
-}
 
-// ── helpers ───────────────────────────────────────────
-/** Local-only id for in-flight uploads (never sent to the backend). */
-function newUid(): string {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return crypto.randomUUID()
+  function legacyOfficeHint(filename: string): string | null {
+    const i = filename.lastIndexOf('.')
+    if (i < 0) return null
+    const ext = filename.slice(i).toLowerCase()
+    const replacement = BLOCKED_LEGACY[ext]
+    return replacement
+      ? `${filename}: ${ext} (Office 97-2003) is not supported — re-save as ${replacement} and re-upload.`
+      : null
   }
-  return `u_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
-}
 
-
-
-
-async function onFiles(files: File[]) {
-  if (!session || files.length === 0) return
-  setError(null)
-  try {
-    const accepted = files.filter((f) => matchesAccept(f, ACCEPT))
-    const rejectedFiles = files.filter((f) => !matchesAccept(f, ACCEPT))
-
-    if (accepted.length === 0) {
-      const hints = rejectedFiles
-        .map((f) => legacyOfficeHint(f.name))
-        .filter((h): h is string => h !== null)
-      setError(
-        hints.length > 0
-          ? hints.join(' · ')
-          : 'Unsupported file type. Accepted: PDF, Office (OOXML), images, plain text.',
-      )
-      return
+  async function verifyExpired() {
+    if (!session) return
+    try {
+      await api.interviews.location(session.id)
+    } catch (e) {
+      if (isSessionError(e)) setSessionExpired(true)
     }
-    if (rejectedFiles.length > 0) {
-      const hints = rejectedFiles
-        .map((f) => legacyOfficeHint(f.name))
-        .filter((h): h is string => h !== null)
-      setError(
-        hints.length > 0
-          ? hints.join(' · ')
-          : `${rejectedFiles.length} file(s) skipped — unsupported type`,
-      )
+  }
+
+  function newUid(): string {
+    if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+      return crypto.randomUUID()
     }
+    return `u_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+  }
 
+  async function onFiles(files: File[]) {
+    if (!session || files.length === 0) return
+    setError(null)
+    try {
+      const accepted = files.filter((f) => matchesAccept(f, ACCEPT))
+      const rejectedFiles = files.filter((f) => !matchesAccept(f, ACCEPT))
 
-    for (const f of accepted) {
-      const id = newUid()
-      setUploads((u) => [...u, { id, filename: f.name, pct: 0 }])
-      try {
-        await api.interviews.documents.upload(session.id, f, (pct) =>
-          setUploads((u) => u.map((x) => (x.id === id ? { ...x, pct } : x))),
+      if (accepted.length === 0) {
+        const hints = rejectedFiles
+          .map((f) => legacyOfficeHint(f.name))
+          .filter((h): h is string => h !== null)
+        setError(
+          hints.length > 0
+            ? hints.join(' · ')
+            : 'Unsupported file type. Accepted: PDF, Office (OOXML), images, plain text.',
         )
-      } catch (e) {
-        if (!handleApiError(e)) {
-          setError(`${f.name}: ${(e as Error).message}`)
-        }
-      } finally {
-        await refresh(session.id)
-        setUploads((u) => u.filter((x) => x.id !== id))
+        return
       }
+      if (rejectedFiles.length > 0) {
+        const hints = rejectedFiles
+          .map((f) => legacyOfficeHint(f.name))
+          .filter((h): h is string => h !== null)
+        setError(
+          hints.length > 0
+            ? hints.join(' · ')
+            : `${rejectedFiles.length} file(s) skipped — unsupported type`,
+        )
+      }
+
+      for (const f of accepted) {
+        const id = newUid()
+        setUploads((u) => [...u, { id, filename: f.name, pct: 0 }])
+        try {
+          await api.interviews.documents.upload(session.id, f, (pct) =>
+            setUploads((u) => u.map((x) => (x.id === id ? { ...x, pct } : x))),
+          )
+        } catch (e) {
+          if (!handleApiError(e)) {
+            setError(`${f.name}: ${(e as Error).message}`)
+          }
+        } finally {
+          const msgs = chat
+            .filter((i): i is Extract<ChatItem, { kind: 'message' }> => i.kind === 'message')
+            .map((i) => ({ role: i.role, content: i.content }))
+          await refresh(session.id, msgs)
+          setUploads((u) => u.filter((x) => x.id !== id))
+        }
+      }
+    } catch (e) {
+      setError((e as Error).message ?? String(e))
     }
-  } catch (e) {
-    setError((e as Error).message ?? String(e))
   }
-}
 
   async function removeDoc(id: string) {
     if (!session) return
     try {
       await api.interviews.documents.remove(session.id, id)
-      await refresh(session.id)
+      const msgs = chat
+        .filter((i): i is Extract<ChatItem, { kind: 'message' }> => i.kind === 'message')
+        .map((i) => ({ role: i.role, content: i.content }))
+      await refresh(session.id, msgs)
     } catch (e) {
       handleApiError(e)
     }
@@ -232,7 +238,7 @@ async function onFiles(files: File[]) {
     if (!confirm('End this session? Documents and chat history will be discarded.')) return
     try {
       await api.interviews.end(session.id)
-      clearPin()
+      unlock()
       setSession(null)
       setDocs([])
       setContext(null)
@@ -240,9 +246,6 @@ async function onFiles(files: File[]) {
       setPlan(null)
       navigate('/')
     } catch (e) {
-      // If the session was already gone, the user's intent is satisfied —
-      // take them home rather than showing the "expired" modal they were
-      // already navigating away from.
       if (isSessionError(e)) {
         navigate('/')
       } else {
@@ -256,7 +259,6 @@ async function onFiles(files: File[]) {
     if (!session || !input.trim() || streaming) return
     const userMsg: ChatMessage = { role: 'user', content: input.trim() }
 
-    // Only `message` items are part of the wire history; cards stay local.
     const priorMessages: ChatMessage[] = chat
       .filter((i): i is Extract<ChatItem, { kind: 'message' }> => i.kind === 'message')
       .map((i) => ({ role: i.role, content: i.content }))
@@ -286,8 +288,6 @@ async function onFiles(files: File[]) {
     }
 
     const insertCard = (card: ServiceCard) => {
-      // Close the current assistant segment (already in state), then append
-      // the card. The next content chunk starts a fresh assistant message.
       assistantBuf = ''
       setChat((prev) => [...prev, { kind: 'card', card }])
     }
@@ -432,10 +432,11 @@ async function onFiles(files: File[]) {
             origin_display_name: loc.origin_display_name,
           })
           setEditingLocation(false)
-          // Nearby services are baked into the system prompt per turn, so a
-          // location change invalidates any existing plan. Clear it so the
-          // Finish button reappears and the user can regenerate.
           setPlan(null)
+          const msgs = chat
+            .filter((i): i is Extract<ChatItem, { kind: 'message' }> => i.kind === 'message')
+            .map((i) => ({ role: i.role, content: i.content }))
+          void refresh(session.id, msgs)
         }}
         onCancel={
           session.postal_code
@@ -571,7 +572,6 @@ async function onFiles(files: File[]) {
         )}
 
         <div className="mt-6 grid gap-6 lg:grid-cols-[3fr_2fr]">
-          {/* Chat panel */}
           <section className="flex flex-col rounded-xl border border-slate-200 bg-white">
             <div className="flex-1 space-y-4 overflow-y-auto p-5" style={{ maxHeight: '60vh' }}>
               {chat.length === 0 && (
@@ -583,16 +583,25 @@ async function onFiles(files: File[]) {
                 if (item.kind === 'card') {
                   return <ServiceCardView key={i} card={item.card} />
                 }
+                const isUser = item.role === 'user'
                 return (
-                  <div key={i} className={item.role === 'user' ? 'text-right' : 'text-left'}>
+                  <div key={i} className={isUser ? 'text-right' : 'text-left'}>
                     <div
-                      className={`inline-block max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm ${
-                        item.role === 'user'
-                          ? 'bg-slate-900 text-white'
+                      className={`inline-block max-w-[85%] rounded-2xl px-4 py-2 text-sm ${
+                        isUser
+                          ? 'bg-slate-900 text-white whitespace-pre-wrap'
                           : 'bg-slate-100 text-slate-900'
                       }`}
                     >
-                      {item.content}
+                      {isUser ? (
+                        item.content
+                      ) : (
+                        <div className="prose prose-sm prose-slate max-w-none prose-p:leading-relaxed prose-pre:bg-slate-800 prose-pre:text-slate-100 prose-a:text-emerald-700">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {item.content}
+                          </ReactMarkdown>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )
@@ -620,7 +629,6 @@ async function onFiles(files: File[]) {
             </form>
           </section>
 
-          {/* Documents panel */}
           <section className="space-y-4">
             <div className="rounded-xl border border-slate-200 bg-white p-5">
               <h2 className="mb-3 text-lg font-medium">Documents</h2>
@@ -704,36 +712,56 @@ async function onFiles(files: File[]) {
               </ul>
             </div>
 
-            {context && (
-              <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm">
-                <div className="flex items-baseline justify-between">
-                  <span className="font-medium">Context budget</span>
-                  <span className="font-mono text-xs text-slate-500">
-                    {context.total_tokens.toLocaleString()} / {context.budget_tokens.toLocaleString()} tokens
-                  </span>
+            {context && (() => {
+              const totalTokens = context.total_tokens ?? 0
+              const contextWindow = context.context_window ?? context.budget_tokens ?? 0
+              const budgetTokens = context.budget_tokens ?? contextWindow
+              const outputReserve = context.output_reserve_tokens ?? (contextWindow - budgetTokens)
+              const included = context.included ?? []
+              const skipped = context.skipped ?? []
+
+              return (
+                <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm">
+                  <div className="flex items-baseline justify-between">
+                    <span className="font-medium">Context budget</span>
+                    <span className="font-mono text-xs text-slate-500">
+                      {totalTokens.toLocaleString()} / {contextWindow.toLocaleString()} tokens
+                    </span>
+                  </div>
+                  {contextWindow > 0 && (
+                    <div className="mt-2 relative h-1.5 overflow-hidden rounded-full bg-slate-100">
+                      <div
+                        className={`h-full ${totalTokens > budgetTokens ? 'bg-red-500' : 'bg-emerald-500'}`}
+                        style={{
+                          width: `${Math.min(100, (totalTokens / contextWindow) * 100)}%`,
+                        }}
+                      />
+                      <div
+                        className="absolute top-0 bottom-0 w-0.5 bg-slate-900 opacity-50"
+                        style={{
+                          left: `${(budgetTokens / contextWindow) * 100}%`,
+                        }}
+                      />
+                    </div>
+                  )}
+                  <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
+                    <span>
+                      {included.length} document
+                      {included.length === 1 ? '' : 's'} included
+                      {skipped.length > 0 && ` · ${skipped.length} skipped`}
+                    </span>
+                    <span>{outputReserve.toLocaleString()} reserved for reply</span>
+                  </div>
+                  {skipped.length > 0 && (
+                    <ul className="mt-2 space-y-1 text-xs text-amber-700">
+                      {skipped.map((s) => (
+                        <li key={s.id}>⚠ {s.filename}: {s.reason}</li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-100">
-                  <div
-                    className="h-full bg-emerald-500"
-                    style={{
-                      width: `${Math.min(100, (context.total_tokens / context.budget_tokens) * 100)}%`,
-                    }}
-                  />
-                </div>
-                <div className="mt-2 text-xs text-slate-500">
-                  {context.included.length} document
-                  {context.included.length === 1 ? '' : 's'} included
-                  {context.skipped.length > 0 && ` · ${context.skipped.length} skipped`}
-                </div>
-                {context.skipped.length > 0 && (
-                  <ul className="mt-2 space-y-1 text-xs text-amber-700">
-                    {context.skipped.map((s) => (
-                      <li key={s.id}>⚠ {s.filename}: {s.reason}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
+              )
+            })()}
           </section>
         </div>
       </div>
@@ -742,8 +770,7 @@ async function onFiles(files: File[]) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Session expired modal — replaces the whole view. The underlying
-// UI is dead anyway, so there's nothing to preserve.
+// Session expired modal
 // ─────────────────────────────────────────────────────────────
 function SessionExpiredModal() {
   return (
@@ -788,10 +815,7 @@ function SessionExpiredModal() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Location gate — debounced autocomplete over /api/geocode/search
-// ─────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────
-// Location gate — autocomplete over /api/geocode/search
+// Location gate
 // ─────────────────────────────────────────────────────────────
 function LocationGate({
   session,
@@ -801,9 +825,7 @@ function LocationGate({
 }: {
   session: InterviewSession
   onLocated: (loc: SessionLocation) => void
-  /** Provided when re-entering the gate mid-session. */
   onCancel?: () => void
-  /** Bubbles up so the parent can show the expired-session modal. */
   onSessionError: () => void
 }) {
   const [query, setQuery] = useState(
@@ -817,10 +839,6 @@ function LocationGate({
     setError(null)
     try {
       const loc = await api.interviews.setLocation(session.id, {
-        // postal_code is the "location label" the session stores for the
-        // prompt header. Prefer the real postcode; fall back to the city,
-        // then to what the user typed. The full address lives in
-        // display_name.
         postal_code: s.postcode || s.city || query.trim(),
         lat: s.lat,
         lng: s.lng,
@@ -841,9 +859,6 @@ function LocationGate({
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     if (busy) return
-    // Free-text fallback: let the backend geocode the typed string and
-    // shorten it. Used when the user hits Enter without picking a
-    // suggestion, or when Photon had no suggestions for what they typed.
     setBusy(true)
     setError(null)
     try {
@@ -913,7 +928,6 @@ function LocationGate({
   )
 }
 
-
 // ─────────────────────────────────────────────────────────────
 // Service card rendered inline in the chat flow
 // ─────────────────────────────────────────────────────────────
@@ -939,8 +953,6 @@ function ServiceCardView({ card }: { card: ServiceCard }) {
     try {
       await navigator.clipboard.writeText(text)
     } catch {
-      // Fallback for browsers / contexts where the async clipboard API is
-      // unavailable (non-HTTPS, older Safari).
       const ta = document.createElement('textarea')
       ta.value = text
       ta.style.position = 'fixed'
