@@ -905,6 +905,58 @@ async def _execute_get_service_details(
 
 # ── context assembly ─────────────────────────────────────
 
+
+def _render_session_context(sess: InterviewSession) -> str:
+    """Build a cache-stable timestamp block for the system prompt.
+
+    Uses sess.created_at (not now()) so the block is identical on every
+    turn and the KV cache survives document uploads — the divergence
+    point stays where documents begin, not at the timestamp.
+
+    Time-of-day is derived from the container's local timezone. Set
+    TZ=America/Vancouver (or similar) in compose.yaml for the period
+    descriptor ("morning"/"evening") to reflect the user's actual day.
+    Without TZ, this is UTC and the descriptor will be wrong for North
+    American users by 4–8 hours.
+    """
+    started = sess.created_at
+    if started.tzinfo is None:
+        # Defensive: Postgres timestamptz should never be naive. Treat
+        # naive as UTC so a future schema change can't silently shift
+        # the date shown to the model.
+        started = started.replace(tzinfo=timezone.utc)
+    local = started.astimezone()  # -> container's local timezone
+
+    day = local.day
+    suffix = (
+        "th" if 11 <= day <= 13
+        else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    )
+    date_str = f"{local.strftime('%A, %B')} {day}{suffix}, {local.year}"
+
+    hour = local.hour
+    if 5 <= hour < 12:
+        period = "morning"
+    elif 12 <= hour < 17:
+        period = "afternoon"
+    elif 17 <= hour < 21:
+        period = "evening"
+    else:
+        period = "night"
+
+    tz_label = local.strftime("%Z") or "UTC"
+    time_str = local.strftime("%H:%M")
+
+    return (
+        f"## Session context\n"
+        f"Today is {date_str}. The conversation started at "
+        f"{time_str} {tz_label} ({period}). Some time may have passed "
+        f"since then."
+    )
+
+
+
+
 async def _build_chat_context(
     sid: UUID, db: AsyncSession, base: str = BASE_SYSTEM_PROMPT
 ):
@@ -913,6 +965,11 @@ async def _build_chat_context(
     Returns (system_prompt, included, skipped, used_tokens). Skips (does not
     stop at) documents that don't fit, so a large early doc doesn't block a
     smaller later one.
+
+    The base prompt is enriched with a session-context block (date + start
+    time) before documents are assembled. This block is stable across the
+    whole session, so the KV cache survives turns and document uploads
+    with a common prefix.
     """
     cfg = _cfg()
     sess = await db.get(InterviewSession, sid)
@@ -948,7 +1005,16 @@ async def _build_chat_context(
             })
 
     rendered = [render_document(json.loads(d.payload_json)) for d in included]
-    system_prompt = assemble_prompt(base, rendered)
+
+    # Enrich the base prompt with the session context block. Appending
+    # (not prepending) keeps the "you are a caseworker" personality
+    # first; the date/time follows as situational context.
+    if sess is not None:
+        enriched_base = base + "\n\n" + _render_session_context(sess)
+    else:
+        enriched_base = base
+
+    system_prompt = assemble_prompt(enriched_base, rendered)
 
     if sess and sess.origin_lat is not None and sess.origin_lng is not None:
         items = await _fetch_nearby_by_ids(db, sess.nearby_service_ids or [], sess)

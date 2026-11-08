@@ -55,7 +55,7 @@ services:
       NAVIGATOR_DATABASE_URL: "postgresql+asyncpg://navigator:${POSTGRES_PASSWORD:-dev-only-change-me}@postgres:5432/navigator"
       NAVIGATOR_SANITIZER_ENDPOINT: "http://sanitizer:8000/ingest"
       NAVIGATOR_PHOTON_ENDPOINT: "http://photon:2322"
-
+      TZ: "${TZ:-America/Vancouver}"
       # Nominatim is not part of the pilot stack. All geocoding goes
       # through Photon. Uncomment + restore the `nominatim-bc` service
       # when the `/lookup` canonical-resolution step lands.

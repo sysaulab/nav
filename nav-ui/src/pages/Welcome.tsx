@@ -23,18 +23,14 @@ export default function Welcome() {
         </header>
 
         <div className="grid gap-6 md:grid-cols-2">
-          <Card
-            to="/interview"
-            title="Get Help!"
-            badge="Ready"
-            description="Guided conversation, document upload, and a personalized plan. One session at a time; everything is wiped when the session ends."
-          />
-          <Card
-            to="/database"
-            title="Directory"
-            badge="Ready"
-            description="Browse and edit the local directory."
-          />
+          <div className="md:col-span-2">
+            <Card
+              to="/interview"
+              title="Get Help!"
+              badge="Ready"
+              description="Guided conversation, document upload, and a personalized plan. One session at a time; everything is wiped when the session ends."
+            />
+          </div>
         </div>
 
         <SystemStatus />

@@ -2,6 +2,10 @@ import { useState } from 'react'
 import { AuthProvider, useAuth } from './auth'
 import { ApiError } from './api'
 import Models from './pages/Models'
+import DirectoryTree from './pages/DirectoryTree'
+import Backup from './pages/Backup'
+
+type Tab = 'directory' | 'models' | 'backup'
 
 export default function App() {
   return (
@@ -13,6 +17,8 @@ export default function App() {
 
 function Shell() {
   const { authed, loading, logout } = useAuth()
+  const [tab, setTab] = useState<Tab>('directory')
+
   if (loading) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-slate-50">
@@ -21,18 +27,14 @@ function Shell() {
     )
   }
   if (!authed) return <LoginGate />
+
   return (
     <main className="min-h-screen bg-slate-50">
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-3">
-          <div className="flex items-center gap-3">
-            <h1 className="text-sm font-semibold text-slate-900">
-              Navigator Admin
-            </h1>
-            <span className="rounded bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500">
-              models
-            </span>
-          </div>
+        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3">
+          <h1 className="text-sm font-semibold text-slate-900">
+            Navigator Admin
+          </h1>
           <button
             onClick={logout}
             className="text-xs text-slate-500 hover:text-slate-900"
@@ -41,10 +43,57 @@ function Shell() {
           </button>
         </div>
       </header>
-      <div className="mx-auto max-w-5xl px-6 py-6">
-        <Models />
+      <div className="mx-auto flex max-w-6xl gap-6 px-6 py-6">
+        <aside className="w-44 shrink-0">
+          <nav className="space-y-1">
+            <NavItem
+              active={tab === 'directory'}
+              onClick={() => setTab('directory')}
+            >
+              Directory
+            </NavItem>
+            <NavItem
+              active={tab === 'backup'}
+              onClick={() => setTab('backup')}
+            >
+              Backup
+            </NavItem>
+            <div className="my-2 border-t border-slate-200" />
+            <NavItem active={tab === 'models'} onClick={() => setTab('models')}>
+              Models
+            </NavItem>
+          </nav>
+        </aside>
+        <section className="min-w-0 flex-1">
+          {tab === 'directory' && <DirectoryTree />}
+          {tab === 'backup' && <Backup />}
+          {tab === 'models' && <Models />}
+        </section>
       </div>
     </main>
+  )
+}
+
+function NavItem({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`block w-full rounded-lg px-3 py-1.5 text-left text-sm ${
+        active
+          ? 'bg-slate-900 text-white'
+          : 'text-slate-600 hover:bg-slate-100'
+      }`}
+    >
+      {children}
+    </button>
   )
 }
 

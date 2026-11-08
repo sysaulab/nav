@@ -320,22 +320,16 @@ def create_app(settings: Settings) -> FastAPI:
                 "error": str(e),
             }
 
+    # Public discovery surface only. Directory management moved to
+    # /admin-api (nav-admin UI). Nothing under /api touches the org/
+    # loc/svc tables anymore.
     for r in (
-        organizations.router,
-        locations.router,
-        services.router,
-        service_at_location.router,
-        nested.router,
         interviews.router,
         exports.router,
     ):
         app.include_router(r, prefix="/api")
 
-    # Admin routes carry their own /admin-api prefix and are NOT under
-    # /api. nav-ui's nginx never proxies this path, so they are
-    # reachable only through nav-admin's nginx.
     app.include_router(admin.router)
-
     return app
 
 

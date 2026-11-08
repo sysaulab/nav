@@ -10,13 +10,6 @@ export class ApiError extends Error {
   }
 }
 
-/**
- * True for the three states the backend uses to say "this session is gone":
- *   410  session expired (idle TTL elapsed)
- *   409  session has ended (status == "ended", defensive)
- *   404  session not found (cookie cleared, or purge already ran)
- * All three should route the user back to /interview to mint a fresh session.
- */
 export function isSessionError(err: unknown): boolean {
   if (!(err instanceof ApiError)) return false
   const d = err.detail.toLowerCase()
@@ -27,20 +20,6 @@ export function isSessionError(err: unknown): boolean {
     (err.status === 404 && d.includes('session not found'))
   )
 }
-
-// ── request observability ─────────────────────────────────
-// The server slides the session deadline on every authenticated
-// request. Because the browser is the one initiating every such
-// request, the client already has the same information the server
-// uses — we just need to surface "a request was sent" to any
-// interested component (currently: the session countdown pill).
-//
-// Listeners are called *before* the fetch starts, not after. The
-// server slides when it processes the request; the send time is
-// the closest local proxy for that. A request that never reaches
-// the server would leave the client optimistically reset — the
-// next real request corrects it, which is a better trade than a
-// two-hop round-trip on every call.
 
 type RequestListener = (sentAtMs: number) => void
 let requestListeners: RequestListener[] = []
@@ -55,11 +34,7 @@ export function onRequest(fn: RequestListener): () => void {
 function notifyRequestSent() {
   const t = Date.now()
   for (const f of requestListeners) {
-    try {
-      f(t)
-    } catch {
-      /* a listener must never break a request */
-    }
+    try { f(t) } catch { /* ignore */ }
   }
 }
 
@@ -79,8 +54,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
-// Multipart upload with progress. XHR because `fetch` cannot report upload
-// progress. Never sets Content-Type — the browser sets the multipart boundary.
 function uploadMultipart<T>(
   path: string,
   file: File,
@@ -114,7 +87,6 @@ function uploadMultipart<T>(
   })
 }
 
-// Shared NDJSON stream reader. Used by both chat and finalize.
 async function streamNdjson(
   path: string,
   messages: import('./types').ChatMessage[],
@@ -140,87 +112,16 @@ async function streamNdjson(
       if (!line.trim()) continue
       try {
         onChunk(JSON.parse(line))
-      } catch {
-        /* skip malformed line */
-      }
+      } catch { /* skip malformed line */ }
     }
   }
 }
 
 export const api = {
-  organizations: {
-    list: () => request<import('./types').Organization[]>('/organizations'),
-    create: (body: import('./types').OrganizationIn) =>
-      request<import('./types').Organization>('/organizations', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    update: (id: string, body: import('./types').OrganizationIn) =>
-      request<import('./types').Organization>(`/organizations/${id}`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
-      }),
-    remove: (id: string) =>
-      request<void>(`/organizations/${id}`, { method: 'DELETE' }),
-  },
-  locations: {
-    listByOrg: (orgId: string) =>
-      request<import('./types').Location[]>(`/organizations/${orgId}/locations`),
-    create: (body: import('./types').LocationIn) =>
-      request<import('./types').Location>('/locations', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    get: (id: string) =>
-      request<import('./types').Location>(`/locations/${id}`),
-    update: (id: string, body: import('./types').LocationIn) =>
-      request<import('./types').Location>(`/locations/${id}`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
-      }),
-    remove: (id: string) =>
-      request<void>(`/locations/${id}`, { method: 'DELETE' }),
-    services: {
-      list: (locationId: string) =>
-        request<import('./types').LocationServiceOut[]>(
-          `/locations/${locationId}/services`,
-        ),
-      create: (locationId: string, body: import('./types').LocationServiceIn) =>
-        request<import('./types').LocationServiceOut>(
-          `/locations/${locationId}/services`,
-          { method: 'POST', body: JSON.stringify(body) },
-        ),
-      remove: (locationId: string, serviceId: string) =>
-        request<void>(`/locations/${locationId}/services/${serviceId}`, {
-          method: 'DELETE',
-        }),
-    },
-  },
-  services: {
-    update: (id: string, body: import('./types').ServiceIn) =>
-      request<import('./types').Service>(`/services/${id}`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
-      }),
-  },
-  serviceAtLocation: {
-    list: (serviceId?: string) => {
-      const qs = serviceId ? `?service_id=${serviceId}` : ''
-      return request<import('./types').ServiceAtLocation[]>(`/service_at_location${qs}`)
-    },
-    create: (body: import('./types').ServiceAtLocationIn) =>
-      request<import('./types').ServiceAtLocation>('/service_at_location', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    remove: (id: string) =>
-      request<void>(`/service_at_location/${id}`, { method: 'DELETE' }),
-  },
   geocode: (q: string) =>
     request<{ lat: number; lng: number; display_name: string | null } | null>(
       `/geocode?q=${encodeURIComponent(q)}`,
     ),
-
   geocodeSearch: (q: string, signal?: AbortSignal) =>
     request<import('./types').GeocodeSuggestion[]>(
       `/geocode/search?q=${encodeURIComponent(q)}`,
@@ -228,15 +129,7 @@ export const api = {
     ),
   health: {
     maestro: () =>
-      request<{
-        status: string
-        service: string
-        version: string
-        ingest_server: string
-        geocoder: string
-        ollama: string
-        model: string
-      }>('/health'),
+      request<{ status: string; service: string; version: string }>('/health'),
     ingest: () =>
       request<{ ok: boolean; endpoint: string; error?: string }>('/health/ingest'),
     geocoder: () =>
@@ -245,9 +138,9 @@ export const api = {
       request<{ ok: boolean; endpoint: string; model: string; error?: string }>(
         '/health/ollama',
       ),
+    sql: () =>
+      request<{ ok: boolean; backend: string; error?: string }>('/health/sql'),
   },
-
-  // ── interview ─────────────────────────────────────────
   interviews: {
     createOrResume: () =>
       request<import('./types').InterviewSession>('/interviews', { method: 'POST' }),
@@ -255,7 +148,6 @@ export const api = {
       request<import('./types').InterviewSession | null>('/interviews/active'),
     end: (sid: string) =>
       request<void>(`/interviews/${sid}`, { method: 'DELETE' }),
-
     location: (sid: string) =>
       request<import('./types').SessionLocation>(`/interviews/${sid}/location`),
     setLocation: (
@@ -271,10 +163,8 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(payload),
       }),
-
     contextPrompt: (sid: string) =>
       request<import('./types').ContextPrompt>(`/interviews/${sid}/context-prompt`),
-
     documents: {
       list: (sid: string) =>
         request<import('./types').DocumentMeta[]>(`/interviews/${sid}/documents`),
@@ -287,13 +177,11 @@ export const api = {
       remove: (sid: string, did: string) =>
         request<void>(`/interviews/${sid}/documents/${did}`, { method: 'DELETE' }),
     },
-
     chat: (
       sid: string,
       messages: import('./types').ChatMessage[],
       onChunk: (obj: unknown) => void,
     ) => streamNdjson(`/interviews/${sid}/chat`, messages, onChunk),
-
     finalize: (
       sid: string,
       messages: import('./types').ChatMessage[],
