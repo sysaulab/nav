@@ -56,6 +56,17 @@ export type ModelSpec = {
 
 export type Defaults = { chat: string; finalize: string }
 
+export type Phone = {
+  id: string
+  number: string
+  type: string | null
+  extension: string | null
+  language: string | null
+  description: string | null
+}
+
+export type PhoneInput = Omit<Phone, 'id'>
+
 export type Organization = {
   id: string
   name: string
@@ -70,9 +81,13 @@ export type Organization = {
   parent_organization_id: string | null
   created_at: string
   updated_at: string
+  phones: Phone[]
 }
 
-export type OrganizationInput = Omit<Organization, 'id' | 'created_at' | 'updated_at'>
+export type OrganizationInput = Omit<
+  Organization,
+  'id' | 'created_at' | 'updated_at' | 'phones'
+>
 
 export type LocationWithCount = {
   id: string
@@ -81,6 +96,7 @@ export type LocationWithCount = {
   latitude: string | null
   longitude: string | null
   service_count: number
+  phones: Phone[]
 }
 
 export type LocationInput = {
@@ -98,12 +114,6 @@ export type Location = Omit<LocationInput, 'organization_id'> & {
   organization_id: string | null
   created_at: string
   updated_at: string
-}
-
-export type ServiceBrief = {
-  id: string
-  name: string
-  status: string
 }
 
 export type Service = {
@@ -126,9 +136,13 @@ export type Service = {
   last_modified: string | null
   created_at: string
   updated_at: string
+  phones: Phone[]
 }
 
-export type ServiceInput = Omit<Service, 'id' | 'organization_id' | 'created_at' | 'updated_at'>
+export type ServiceInput = Omit<
+  Service,
+  'id' | 'organization_id' | 'created_at' | 'updated_at' | 'phones'
+>
 
 export type GeocodeSuggestion = {
   lat: number
@@ -144,22 +158,39 @@ export const api = {
     list: () => request<ModelSpec[]>('/models'),
     get: (id: string) => request<ModelSpec>(`/models/${encodeURIComponent(id)}`),
     put: (id: string, body: ModelSpec) =>
-      request<ModelSpec>(`/models/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(body) }),
-    remove: (id: string) => request<void>(`/models/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      request<ModelSpec>(`/models/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+    remove: (id: string) =>
+      request<void>(`/models/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     defaults: () => request<Defaults>('/models/defaults'),
     setDefaults: (body: Partial<Defaults>) =>
-      request<Defaults>('/models/defaults', { method: 'PUT', body: JSON.stringify(body) }),
+      request<Defaults>('/models/defaults', {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
   },
   geocodeSearch: (q: string, signal?: AbortSignal) =>
-    request<GeocodeSuggestion[]>(`/geocode/search?q=${encodeURIComponent(q)}`, { signal }),
+    request<GeocodeSuggestion[]>(`/geocode/search?q=${encodeURIComponent(q)}`, {
+      signal,
+    }),
   directory: {
     orgs: {
       list: (page: number, pageSize = 50) =>
-        request<Page<Organization>>(`/organizations?page=${page}&page_size=${pageSize}`),
+        request<Page<Organization>>(
+          `/organizations?page=${page}&page_size=${pageSize}`,
+        ),
       create: (body: OrganizationInput) =>
-        request<Organization>('/organizations', { method: 'POST', body: JSON.stringify(body) }),
+        request<Organization>('/organizations', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
       update: (id: string, body: OrganizationInput) =>
-        request<Organization>(`/organizations/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+        request<Organization>(`/organizations/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        }),
       remove: (id: string) =>
         request<void>(`/organizations/${id}`, { method: 'DELETE' }),
     },
@@ -167,9 +198,15 @@ export const api = {
       listForOrg: (orgId: string) =>
         request<LocationWithCount[]>(`/organizations/${orgId}/locations`),
       create: (orgId: string, body: LocationInput) =>
-        request<Location>(`/organizations/${orgId}/locations`, { method: 'POST', body: JSON.stringify(body) }),
+        request<Location>(`/organizations/${orgId}/locations`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
       update: (id: string, body: LocationInput) =>
-        request<Location>(`/locations/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+        request<Location>(`/locations/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        }),
       remove: (id: string) =>
         request<void>(`/locations/${id}`, { method: 'DELETE' }),
     },
@@ -177,12 +214,32 @@ export const api = {
       listForLoc: (locId: string) =>
         request<Service[]>(`/locations/${locId}/services`),
       create: (locId: string, body: ServiceInput) =>
-        request<Service>(`/locations/${locId}/services`, { method: 'POST', body: JSON.stringify(body) }),
+        request<Service>(`/locations/${locId}/services`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
       update: (id: string, body: ServiceInput) =>
-        request<Service>(`/services/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+        request<Service>(`/services/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        }),
       remove: (id: string) =>
         request<void>(`/services/${id}`, { method: 'DELETE' }),
-    }
+    },
+    phones: {
+      create: (ownerType: 'org' | 'loc' | 'svc', ownerId: string, body: PhoneInput) =>
+        request<Phone>(`/phones/${ownerType}/${ownerId}`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
+      update: (id: string, body: PhoneInput) =>
+        request<Phone>(`/phones/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        }),
+      remove: (id: string) =>
+        request<void>(`/phones/${id}`, { method: 'DELETE' }),
+    },
   },
   backup: {
     exportDatabase: async () => {
@@ -202,14 +259,16 @@ export const api = {
       const form = new FormData()
       form.append('file', file)
       form.append('mode', 'replace')
-      
       const res = await fetch(`${BASE}/database/import`, {
         method: 'POST',
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: form,
       })
       if (!res.ok) throw new ApiError(res.status, await res.text())
-      return res.json() as Promise<{ ok: boolean; counts: Record<string, number> }>
-    }
-  }
+      return res.json() as Promise<{
+        ok: boolean
+        counts: Record<string, number>
+      }>
+    },
+  },
 }

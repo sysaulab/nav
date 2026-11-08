@@ -54,14 +54,6 @@ export default function Interview() {
 
   
   // ── bootstrap ─────────────────────────────────────────
-  useEffect(() => {
-    let live = true
-    api.interviews.createOrResume()
-      .then((s) => { if (live) setSession(s) })
-      .catch((e: Error) => { if (live) setError(e.message) })
-    return () => { live = false }
-  }, [])
-
   const refresh = useCallback(async (sid: string) => {
     try {
       const [d, c] = await Promise.all([
@@ -75,9 +67,61 @@ export default function Interview() {
     }
   }, [handleApiError])
 
+  // ── bootstrap ─────────────────────────────────────────
   useEffect(() => {
-    if (session) void refresh(session.id)
-  }, [session, refresh])
+    let live = true
+
+    async function init() {
+      try {
+        console.log('[init] starting')
+        const s = await api.interviews.createOrResume()
+        console.log('[init] session:', s.id, 'postal_code:', s.postal_code)
+        if (!live) return
+
+        let finalSession = s
+        const pendingRaw = sessionStorage.getItem('pending_location')
+        console.log('[init] pending_location present:', !!pendingRaw)
+
+        if (pendingRaw) {
+          sessionStorage.removeItem('pending_location')
+          try {
+            const pending = JSON.parse(pendingRaw) as GeocodeSuggestion
+            console.log('[init] applying pending location:', pending.display_name)
+            const loc = await api.interviews.setLocation(s.id, {
+              postal_code: pending.postcode || pending.city || 'Unknown',
+              lat: pending.lat,
+              lng: pending.lng,
+              display_name: pending.display_name,
+            })
+            console.log('[init] location resolved:', loc.postal_code)
+            if (!live) return
+            finalSession = {
+              ...s,
+              postal_code: loc.postal_code,
+              origin_display_name: loc.origin_display_name,
+            }
+          } catch (e) {
+            console.error('[init] setLocation failed:', e)
+          }
+        }
+
+        if (!live) return
+        console.log('[init] setting session, final postal_code:', finalSession.postal_code)
+        setSession(finalSession)
+
+        if (!finalSession.postal_code) {
+          console.log('[init] no location, navigating to welcome')
+          navigate('/', { replace: true })
+        }
+      } catch (e) {
+        console.error('[init] fatal:', e)
+        if (live) setError((e as Error).message || 'Failed to start session')
+      }
+    }
+
+    void init()
+    return () => { live = false }
+  }, [])
 
   // ── upload ────────────────────────────────────────────
 const ACCEPT =

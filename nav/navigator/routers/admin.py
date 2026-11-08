@@ -6,7 +6,8 @@ import urllib.parse
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status, File, Form, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import delete as sa_delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,16 +17,13 @@ from ..ai.registry import get_registry, reload_registry
 from ..config import Settings
 from ..db import get_db
 from ..models import (
-    AppSetting, Location, Organization, Service, ServiceAtLocation,
+    AppSetting, Location, Organization, Phone, Service, ServiceAtLocation,
 )
 from ..schemas import (
     LocationIn, LocationOut, LocationServiceIn, OrganizationIn, OrganizationOut,
     ServiceIn, ServiceOut,
 )
 from ..settings_store import delete_app_setting, set_app_setting
-
-from fastapi import File, Form, UploadFile
-from fastapi.responses import Response
 from ..backup import export_directory, import_directory
 from datetime import datetime, timezone
 
@@ -57,6 +55,47 @@ async def require_admin(
     token = authorization.removeprefix("Bearer ").strip()
     if token != cfg.admin_token:
         raise HTTPException(401, "invalid admin token")
+
+
+# ── phone schemas ────────────────────────────────────────
+
+class PhoneIn(BaseModel):
+    number: str = Field(min_length=1, max_length=50)
+    type: str | None = Field(default=None, max_length=50)
+    extension: str | None = Field(default=None, max_length=20)
+    language: str | None = Field(default=None, max_length=50)
+    description: str | None = None
+
+
+class PhoneOut(BaseModel):
+    id: str
+    number: str
+    type: str | None
+    extension: str | None
+    language: str | None
+    description: str | None
+
+    @classmethod
+    def from_orm(cls, p: Phone) -> "PhoneOut":
+        return cls(
+            id=str(p.id), number=p.number, type=p.type,
+            extension=p.extension, language=p.language, description=p.description,
+        )
+
+
+async def _fetch_phones(
+    db: AsyncSession, field: str, owner_ids: list[UUID],
+) -> dict[UUID, list[PhoneOut]]:
+    if not owner_ids:
+        return {}
+    col = getattr(Phone, field)
+    stmt = select(Phone).where(col.in_(owner_ids)).order_by(Phone.number)
+    rows = (await db.execute(stmt)).scalars().all()
+    out: dict[UUID, list[PhoneOut]] = {}
+    for r in rows:
+        oid = getattr(r, field)
+        out.setdefault(oid, []).append(PhoneOut.from_orm(r))
+    return out
 
 
 # ── health ───────────────────────────────────────────────
@@ -223,8 +262,11 @@ async def admin_geocode_search(
 
 # ── directory: organizations ─────────────────────────────
 
+class AdminOrgOut(OrganizationOut):
+    phones: list[PhoneOut] = []
+
 class OrganizationsPage(BaseModel):
-    items: list[OrganizationOut]
+    items: list[AdminOrgOut]
     total: int
     page: int
     page_size: int
@@ -247,8 +289,16 @@ async def list_organizations(
         .limit(page_size)
     )).scalars().all()
 
+    phones_map = await _fetch_phones(db, "organization_id", [r.id for r in rows])
+
+    items = []
+    for org in rows:
+        item = AdminOrgOut.model_validate(org)
+        item.phones = phones_map.get(org.id, [])
+        items.append(item)
+
     return OrganizationsPage(
-        items=[OrganizationOut.model_validate(r) for r in rows],
+        items=items,
         total=total, page=page, page_size=page_size,
     )
 
@@ -280,7 +330,6 @@ async def delete_organization(org_id: UUID, db: AsyncSession = Depends(get_db)) 
     if not org:
         raise HTTPException(404, "organization not found")
 
-    # Strict cascade: Org -> Location -> Service
     loc_ids = (await db.execute(select(Location.id).where(Location.organization_id == org_id))).scalars().all()
     svc_ids = (await db.execute(select(Service.id).where(Service.organization_id == org_id))).scalars().all()
     
@@ -297,6 +346,9 @@ async def delete_organization(org_id: UUID, db: AsyncSession = Depends(get_db)) 
 
 # ── directory: locations ─────────────────────────────────
 
+class AdminLocOut(LocationOut):
+    phones: list[PhoneOut] = []
+
 class LocationWithCount(BaseModel):
     id: str
     name: str | None
@@ -304,6 +356,7 @@ class LocationWithCount(BaseModel):
     latitude: str | None
     longitude: str | None
     service_count: int
+    phones: list[PhoneOut] = []
 
 
 @router.get("/organizations/{org_id}/locations", response_model=list[LocationWithCount], dependencies=[Depends(require_admin)])
@@ -323,12 +376,16 @@ async def list_org_locations(org_id: UUID, db: AsyncSession = Depends(get_db)) -
         .order_by(Location.name.nulls_last(), Location.id)
     )
     rows = (await db.execute(stmt)).all()
+    
+    phones_map = await _fetch_phones(db, "location_id", [r.id for r in rows])
+
     return [
         LocationWithCount(
             id=str(r.id), name=r.name, address=r.address,
             latitude=str(r.latitude) if r.latitude is not None else None,
             longitude=str(r.longitude) if r.longitude is not None else None,
             service_count=int(r.svc_count),
+            phones=phones_map.get(r.id, []),
         )
         for r in rows
     ]
@@ -339,7 +396,6 @@ async def create_location(org_id: UUID, payload: LocationIn, db: AsyncSession = 
     if not await db.get(Organization, org_id):
         raise HTTPException(404, "organization not found")
     
-    # Fix: exclude organization_id to prevent duplicate kwargs
     data = payload.model_dump(exclude={"organization_id"})
     loc = Location(**data, organization_id=org_id)
     db.add(loc)
@@ -354,7 +410,7 @@ async def update_location(loc_id: UUID, payload: LocationIn, db: AsyncSession = 
     if not loc:
         raise HTTPException(404, "location not found")
     for k, v in payload.model_dump().items():
-        if k != "organization_id": # Prevent moving orgs via this endpoint
+        if k != "organization_id":
             setattr(loc, k, v)
     await db.commit()
     await db.refresh(loc)
@@ -367,8 +423,6 @@ async def delete_location(loc_id: UUID, db: AsyncSession = Depends(get_db)) -> N
     if not loc:
         raise HTTPException(404, "location not found")
 
-    svc_ids = (await db.execute(select(Service.id).where(Service.organization_id == loc.organization_id))).scalars().all()
-    # Filter svc_ids to only those actually at this location
     sal_svc_ids = (await db.execute(select(ServiceAtLocation.service_id).where(ServiceAtLocation.location_id == loc_id))).scalars().all()
     
     if sal_svc_ids:
@@ -381,8 +435,12 @@ async def delete_location(loc_id: UUID, db: AsyncSession = Depends(get_db)) -> N
 
 # ── directory: services ──────────────────────────────────
 
-@router.get("/locations/{loc_id}/services", response_model=list[ServiceOut], dependencies=[Depends(require_admin)])
-async def list_loc_services(loc_id: UUID, db: AsyncSession = Depends(get_db)) -> list[ServiceOut]:
+class AdminSvcOut(ServiceOut):
+    phones: list[PhoneOut] = []
+
+
+@router.get("/locations/{loc_id}/services", response_model=list[AdminSvcOut], dependencies=[Depends(require_admin)])
+async def list_loc_services(loc_id: UUID, db: AsyncSession = Depends(get_db)) -> list[AdminSvcOut]:
     if not await db.get(Location, loc_id):
         raise HTTPException(404, "location not found")
 
@@ -393,7 +451,16 @@ async def list_loc_services(loc_id: UUID, db: AsyncSession = Depends(get_db)) ->
         .order_by(Service.name)
     )
     rows = (await db.execute(stmt)).scalars().all()
-    return [ServiceOut.model_validate(r) for r in rows]
+    
+    phones_map = await _fetch_phones(db, "service_id", [r.id for r in rows])
+
+    items = []
+    for svc in rows:
+        item = AdminSvcOut.model_validate(svc)
+        item.phones = phones_map.get(svc.id, [])
+        items.append(item)
+
+    return items
 
 
 @router.post("/locations/{loc_id}/services", response_model=ServiceOut, status_code=201, dependencies=[Depends(require_admin)])
@@ -402,7 +469,6 @@ async def create_service(loc_id: UUID, payload: LocationServiceIn, db: AsyncSess
     if not loc or not loc.organization_id:
         raise HTTPException(400, "location not found or has no organization")
 
-    # Fix: exclude organization_id, use LocationServiceIn which allows it to be optional
     data = payload.model_dump(exclude={"organization_id"})
     svc = Service(**data, organization_id=loc.organization_id)
     db.add(svc)
@@ -421,7 +487,6 @@ async def update_service(svc_id: UUID, payload: LocationServiceIn, db: AsyncSess
     if not svc:
         raise HTTPException(404, "service not found")
     
-    # Fix: exclude organization_id from update
     data = payload.model_dump(exclude={"organization_id"})
     for k, v in data.items():
         setattr(svc, k, v)
@@ -439,54 +504,79 @@ async def delete_service(svc_id: UUID, db: AsyncSession = Depends(get_db)) -> No
     await db.delete(svc)
     await db.commit()
 
+
+# ── directory: phones ────────────────────────────────────
+
+@router.post("/phones/{owner_type}/{owner_id}", response_model=PhoneOut, status_code=201, dependencies=[Depends(require_admin)])
+async def create_phone(owner_type: str, owner_id: UUID, payload: PhoneIn, db: AsyncSession = Depends(get_db)) -> PhoneOut:
+    kwargs = {}
+    if owner_type == "org":
+        if not await db.get(Organization, owner_id): raise HTTPException(404, "org not found")
+        kwargs["organization_id"] = owner_id
+    elif owner_type == "loc":
+        if not await db.get(Location, owner_id): raise HTTPException(404, "loc not found")
+        kwargs["location_id"] = owner_id
+    elif owner_type == "svc":
+        if not await db.get(Service, owner_id): raise HTTPException(404, "svc not found")
+        kwargs["service_id"] = owner_id
+    else:
+        raise HTTPException(400, "invalid owner_type")
+
+    p = Phone(**payload.model_dump(), **kwargs)
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return PhoneOut.from_orm(p)
+
+
+@router.put("/phones/{phone_id}", response_model=PhoneOut, dependencies=[Depends(require_admin)])
+async def update_phone(phone_id: UUID, payload: PhoneIn, db: AsyncSession = Depends(get_db)) -> PhoneOut:
+    p = await db.get(Phone, phone_id)
+    if not p:
+        raise HTTPException(404, "phone not found")
+    for k, v in payload.model_dump().items():
+        setattr(p, k, v)
+    await db.commit()
+    await db.refresh(p)
+    return PhoneOut.from_orm(p)
+
+
+@router.delete("/phones/{phone_id}", status_code=204, dependencies=[Depends(require_admin)])
+async def delete_phone(phone_id: UUID, db: AsyncSession = Depends(get_db)) -> None:
+    p = await db.get(Phone, phone_id)
+    if not p:
+        raise HTTPException(404, "phone not found")
+    await db.delete(p)
+    await db.commit()
+
+
 # ── database backup & restore ────────────────────────────
 
 @router.get("/database/export", dependencies=[Depends(require_admin)])
 async def admin_export_database(db: AsyncSession = Depends(get_db)) -> Response:
-    """Download a JSON snapshot of the directory tables."""
     payload = await export_directory(db)
-    body = json.dumps(
-        payload, separators=(",", ":"), ensure_ascii=False,
-    ).encode("utf-8")
-
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     filename = f"navigator-backup-{stamp}.json"
-
     return Response(
-        content=body,
-        media_type="application/json",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(body)),
-        },
+        content=body, media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Content-Length": str(len(body))},
     )
 
 @router.post("/database/import", dependencies=[Depends(require_admin)])
 async def admin_import_database(
-    file: UploadFile = File(...),
-    mode: str = Form("replace"),
-    db: AsyncSession = Depends(get_db),
+    file: UploadFile = File(...), mode: str = Form("replace"), db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Replace the directory from a JSON snapshot.
-
-    Wrapped in a single transaction and serialised by a Postgres
-    advisory lock. A failure leaves the directory unchanged.
-    """
     if mode != "replace":
         raise HTTPException(400, f"unsupported import mode: {mode!r}")
-
     raw = await file.read()
-    if len(raw) > 100 * 1024 * 1024:  # 100MB cap
+    if len(raw) > 100 * 1024 * 1024:
         raise HTTPException(413, "import exceeds 100MB limit")
-
     try:
         payload = json.loads(raw)
     except ValueError as e:
         raise HTTPException(400, f"invalid JSON: {e}")
-
-    # Serialise concurrent imports across replicas.
     await db.execute(text("SELECT pg_advisory_xact_lock(920112)"))
-
     try:
         counts = await import_directory(db, payload, mode=mode)
         await db.commit()
@@ -496,5 +586,4 @@ async def admin_import_database(
     except Exception as e:
         await db.rollback()
         raise HTTPException(500, f"import failed: {e}")
-
     return {"ok": True, "mode": mode, "counts": counts}
