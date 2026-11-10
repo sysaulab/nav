@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import math
 import urllib.parse
 from typing import Any
 from uuid import UUID
@@ -9,7 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status, File, Form, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import delete as sa_delete, func, select, text
+from sqlalchemy import delete as sa_delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai.base import ModelSpec
@@ -25,6 +27,10 @@ from ..schemas import (
 )
 from ..settings_store import delete_app_setting, set_app_setting
 from ..backup import export_directory, import_directory
+from ..runtime import (
+    KEY_ADMIN_TOKEN, KEY_CHAT_PROMPT, KEY_FINALIZE_PROMPT, KEY_NEARBY,
+    defaults_for, get_runtime, reload_runtime,
+)
 from datetime import datetime, timezone
 
 log = logging.getLogger("navigator.admin")
@@ -47,13 +53,15 @@ def _cfg() -> Settings:
 async def require_admin(
     authorization: str | None = Header(default=None),
 ) -> None:
-    cfg = _cfg()
-    if not cfg.admin_token:
+    # Effective token = DB override if present, else env. Runtime holds
+    # the effective value; see navigator/runtime.py.
+    effective = get_runtime().current().admin_token
+    if not effective:
         raise HTTPException(503, "admin is not configured on this server")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "missing bearer token")
     token = authorization.removeprefix("Bearer ").strip()
-    if token != cfg.admin_token:
+    if not hmac.compare_digest(token.encode(), effective.encode()):
         raise HTTPException(401, "invalid admin token")
 
 
@@ -208,6 +216,86 @@ async def delete_model(model_id: str, db: AsyncSession = Depends(get_db)) -> Non
         raise HTTPException(404, "model not found (no DB override)")
     await reload_registry(db, _cfg())
 
+# ── admin token ──────────────────────────────────────────
+
+class TokenStatusOut(BaseModel):
+    configured: bool
+    source: str                     # "env" | "database" | "none"
+
+
+@router.get("/auth/status", dependencies=[Depends(require_admin)])
+async def token_status(db: AsyncSession = Depends(get_db)) -> TokenStatusOut:
+    effective = get_runtime().current().admin_token
+    if not effective:
+        return TokenStatusOut(configured=False, source="none")
+    # Mirror runtime.load()'s override detection: a non-empty DB value
+    # that parses to a non-empty string means the operator has set a
+    # custom token via this console.
+    row = await db.get(AppSetting, KEY_ADMIN_TOKEN)
+    has_override = False
+    if row is not None and row.value.strip():
+        try:
+            v = json.loads(row.value)
+            if isinstance(v, str) and v:
+                has_override = True
+        except json.JSONDecodeError:
+            has_override = True
+    return TokenStatusOut(
+        configured=True,
+        source="database" if has_override else "env",
+    )
+
+
+class ChangeTokenIn(BaseModel):
+    current_token: str = Field(min_length=1)
+    new_token: str = Field(min_length=16)
+    confirm_token: str = Field(min_length=16)
+
+
+@router.put("/auth/token", dependencies=[Depends(require_admin)])
+async def change_admin_token(
+    payload: ChangeTokenIn,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    effective = get_runtime().current().admin_token
+    if not effective:
+        # Unreachable: require_admin 503s first. Kept as belt-and-suspenders
+        # so a future refactor can't silently allow token reset on an
+        # unconfigured server.
+        raise HTTPException(503, "admin is not configured on this server")
+
+    if not hmac.compare_digest(
+        payload.current_token.encode(), effective.encode(),
+    ):
+        raise HTTPException(401, "current token is incorrect")
+
+    if payload.new_token != payload.confirm_token:
+        raise HTTPException(400, "new_token and confirm_token do not match")
+
+    if hmac.compare_digest(
+        payload.new_token.encode(), effective.encode(),
+    ):
+        raise HTTPException(400, "new token is identical to current")
+
+    await set_app_setting(db, KEY_ADMIN_TOKEN, payload.new_token)
+
+    # The DB write committed above. If reload fails between here and
+    # return, the DB has the new token but the runtime still validates
+    # against the old one — a lockout once the client updates its
+    # sessionStorage. Surface this loudly: the operator needs to
+    # restart, then log in with the new token.
+    try:
+        await reload_runtime(db, _cfg())
+    except Exception as e:
+        log.exception("auth.token_reload_failed err=%s", e)
+        raise HTTPException(
+            500,
+            "Token was saved to the database but the runtime failed to "
+            "reload. Restart the server to apply it, then sign in with "
+            "the new token. Detail: " + str(e),
+        )
+
+    return {"ok": True}
 
 # ── geocoding proxy ──────────────────────────────────────
 
@@ -259,6 +347,115 @@ async def admin_geocode_search(
         })
     return out
 
+
+# ── prompt & nearby parameters ───────────────────────────
+
+class PromptStateOut(BaseModel):
+    chat_prompt: str
+    finalize_prompt: str
+    nearby: dict[str, Any]
+    defaults: dict[str, Any]
+    overridden: dict[str, bool]
+
+
+@router.get("/prompt", dependencies=[Depends(require_admin)])
+async def get_prompt_state(
+    db: AsyncSession = Depends(get_db),
+) -> PromptStateOut:
+    rt = get_runtime().current()
+    d = defaults_for(_cfg())
+
+    rows = (await db.execute(
+        select(AppSetting).where(
+            AppSetting.key.in_(
+                [KEY_CHAT_PROMPT, KEY_FINALIZE_PROMPT, KEY_NEARBY]
+            )
+        )
+    )).scalars().all()
+    present = {r.key for r in rows}
+
+    return PromptStateOut(
+        chat_prompt=rt.chat_prompt,
+        finalize_prompt=rt.finalize_prompt,
+        nearby=rt.nearby.to_dict(),
+        defaults={
+            "chat_prompt": d.chat_prompt,
+            "finalize_prompt": d.finalize_prompt,
+            "nearby": d.nearby.to_dict(),
+        },
+        overridden={
+            "chat": KEY_CHAT_PROMPT in present,
+            "finalize": KEY_FINALIZE_PROMPT in present,
+            "nearby": KEY_NEARBY in present,
+        },
+    )
+
+
+class PromptTextIn(BaseModel):
+    text: str = Field(min_length=1)
+
+
+@router.put("/prompt/chat", dependencies=[Depends(require_admin)])
+async def put_chat_prompt(
+    payload: PromptTextIn,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    await set_app_setting(db, KEY_CHAT_PROMPT, payload.text)
+    await reload_runtime(db, _cfg())
+    return {"ok": True}
+
+
+@router.put("/prompt/finalize", dependencies=[Depends(require_admin)])
+async def put_finalize_prompt(
+    payload: PromptTextIn,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    await set_app_setting(db, KEY_FINALIZE_PROMPT, payload.text)
+    await reload_runtime(db, _cfg())
+    return {"ok": True}
+
+
+class NearbyIn(BaseModel):
+    radius_km: float = Field(gt=0, le=1000)
+    location_limit: int = Field(gt=0, le=500)
+    index_limit: int = Field(gt=0, le=2000)
+
+
+@router.put("/prompt/nearby", dependencies=[Depends(require_admin)])
+async def put_nearby(
+    payload: NearbyIn,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if payload.location_limit > payload.index_limit:
+        raise HTTPException(
+            400,
+            "location_limit must be <= index_limit "
+            "(location_limit is the number of places; index_limit is "
+            "the number of services drawn from them)",
+        )
+    await set_app_setting(db, KEY_NEARBY, payload.model_dump())
+    await reload_runtime(db, _cfg())
+    return {"ok": True}
+
+
+@router.delete(
+    "/prompt/{section}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
+async def reset_prompt_section(
+    section: str,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    key = {
+        "chat": KEY_CHAT_PROMPT,
+        "finalize": KEY_FINALIZE_PROMPT,
+        "nearby": KEY_NEARBY,
+    }.get(section)
+    if key is None:
+        raise HTTPException(404, f"unknown section: {section!r}")
+    await delete_app_setting(db, key)
+    await reload_runtime(db, _cfg())
 
 # ── directory: organizations ─────────────────────────────
 
@@ -352,6 +549,8 @@ class AdminLocOut(LocationOut):
 class LocationWithCount(BaseModel):
     id: str
     name: str | None
+    alternate_name: str | None
+    description: str | None
     address: str | None
     latitude: str | None
     longitude: str | None
@@ -366,8 +565,8 @@ async def list_org_locations(org_id: UUID, db: AsyncSession = Depends(get_db)) -
 
     stmt = (
         select(
-            Location.id, Location.name, Location.address,
-            Location.latitude, Location.longitude,
+            Location.id, Location.name, Location.alternate_name, Location.description,
+            Location.address, Location.latitude, Location.longitude,
             func.count(ServiceAtLocation.id).label("svc_count"),
         )
         .outerjoin(ServiceAtLocation, ServiceAtLocation.location_id == Location.id)
@@ -376,12 +575,15 @@ async def list_org_locations(org_id: UUID, db: AsyncSession = Depends(get_db)) -
         .order_by(Location.name.nulls_last(), Location.id)
     )
     rows = (await db.execute(stmt)).all()
-    
     phones_map = await _fetch_phones(db, "location_id", [r.id for r in rows])
 
     return [
         LocationWithCount(
-            id=str(r.id), name=r.name, address=r.address,
+            id=str(r.id),
+            name=r.name,
+            alternate_name=r.alternate_name,
+            description=r.description,
+            address=r.address,
             latitude=str(r.latitude) if r.latitude is not None else None,
             longitude=str(r.longitude) if r.longitude is not None else None,
             service_count=int(r.svc_count),
@@ -389,6 +591,199 @@ async def list_org_locations(org_id: UUID, db: AsyncSession = Depends(get_db)) -
         )
         for r in rows
     ]
+
+# ── flat location search ─────────────────────────────────
+
+class OrgOption(BaseModel):
+    id: str
+    name: str
+
+
+@router.get("/organizations/options", dependencies=[Depends(require_admin)])
+async def organization_options(db: AsyncSession = Depends(get_db)) -> list[OrgOption]:
+    rows = (await db.execute(
+        select(Organization.id, Organization.name).order_by(Organization.name)
+    )).all()
+    return [OrgOption(id=str(r.id), name=r.name) for r in rows]
+
+
+class LocationAdminRow(BaseModel):
+    id: str
+    name: str | None
+    alternate_name: str | None
+    description: str | None
+    address: str | None
+    latitude: float | None
+    longitude: float | None
+    organization_id: str | None
+    organization_name: str | None
+    service_count: int
+    distance_km: float | None = None
+
+
+class LocationsPage(BaseModel):
+    items: list[LocationAdminRow]
+    total: int
+    page: int
+    page_size: int
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+@router.get("/locations", dependencies=[Depends(require_admin)])
+async def search_locations(
+    db: AsyncSession = Depends(get_db),
+    q: str | None = Query(None, description="Partial match on name or alternate name"),
+    lat: float | None = Query(None, ge=-90, le=90),
+    lng: float | None = Query(None, ge=-180, le=180),
+    radius_km: float | None = Query(
+        None,
+        gt=0,
+        le=1000,
+        description="Optional max distance (km) from lat/lng. Omit to sort by distance.",
+    ),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+) -> LocationsPage:
+    if (lat is None) != (lng is None):
+        raise HTTPException(400, "lat and lng must be provided together")
+    if radius_km is not None and lat is None:
+        raise HTTPException(400, "radius_km requires lat and lng")
+
+    base = (
+        select(
+            Location,
+            Organization.name.label("org_name"),
+            func.count(ServiceAtLocation.id).label("svc_count"),
+        )
+        .outerjoin(Organization, Organization.id == Location.organization_id)
+        .outerjoin(ServiceAtLocation, ServiceAtLocation.location_id == Location.id)
+        .group_by(Location.id, Organization.name)
+    )
+
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        base = base.where(
+            Location.name.ilike(like)
+            | Location.alternate_name.ilike(like)
+        )
+
+    # ── Distance mode ──────────────────────────────────────────
+    #
+    # NULL coordinates mean the location is a global service (a crisis
+    # line, a province-wide program, an info number). It applies to
+    # every customer regardless of address, so it ranks first — it is
+    # NOT a coordinate-less anomaly to be hidden.
+    #
+    # Rows are partitioned into globals (NULL coords) and locals (coords
+    # present). Globals are sorted by name for stable ordering; locals
+    # are sorted by distance with name as a stable tiebreak. Concatenated
+    # for pagination: globals, then locals.
+    if lat is not None and lng is not None:
+        if radius_km is not None:
+            pad_lat = radius_km / 111.0
+            cos_lat = max(math.cos(math.radians(lat)), 0.01)
+            pad_lng = pad_lat / cos_lat
+            base = base.where(
+                Location.latitude.between(lat - pad_lat, lat + pad_lat),
+                Location.longitude.between(lng - pad_lng, lng + pad_lng),
+            )
+
+        rows = (await db.execute(base)).all()
+        globals_list: list[tuple[Any, Any, int]] = []
+        locals_list: list[tuple[Any, Any, int, float]] = []
+
+        for loc, org_name, svc_count in rows:
+            if loc.latitude is None or loc.longitude is None:
+                globals_list.append((loc, org_name, int(svc_count)))
+                continue
+            d = _haversine_km(lat, lng, float(loc.latitude), float(loc.longitude))
+            if radius_km is not None and d > radius_km:
+                continue
+            locals_list.append((loc, org_name, int(svc_count), d))
+
+        globals_list.sort(key=lambda x: (x[0].name or "").lower())
+        locals_list.sort(key=lambda x: (x[3], (x[0].name or "").lower()))
+
+        combined: list[tuple[Any, Any, int, float | None]] = [
+            (loc, org_name, sc, None) for loc, org_name, sc in globals_list
+        ] + locals_list
+
+        total = len(combined)
+        start = (page - 1) * page_size
+        items = [
+            LocationAdminRow(
+                id=str(loc.id), name=loc.name,
+                alternate_name=loc.alternate_name, description=loc.description,
+                address=loc.address,
+                latitude=float(loc.latitude) if loc.latitude is not None else None,
+                longitude=float(loc.longitude) if loc.longitude is not None else None,
+                organization_id=str(loc.organization_id) if loc.organization_id else None,
+                organization_name=org_name,
+                service_count=sc,
+                distance_km=round(d, 2) if d is not None else None,
+            )
+            for loc, org_name, sc, d in combined[start:start + page_size]
+        ]
+        return LocationsPage(items=items, total=total, page=page, page_size=page_size)
+
+    # ── Alphabetical mode (no origin) ──────────────────────────
+    #
+    # Unchanged. Globals are mixed in by name; they're not ranked first
+    # here because the user explicitly asked for alphabetical order.
+    total = (await db.execute(
+        select(func.count()).select_from(base.subquery())
+    )).scalar() or 0
+    rows = (await db.execute(
+        base.order_by(Location.name.nulls_last(), Location.id)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )).all()
+    items = [
+        LocationAdminRow(
+            id=str(loc.id), name=loc.name,
+            alternate_name=loc.alternate_name, description=loc.description,
+            address=loc.address,
+            latitude=float(loc.latitude) if loc.latitude is not None else None,
+            longitude=float(loc.longitude) if loc.longitude is not None else None,
+            organization_id=str(loc.organization_id) if loc.organization_id else None,
+            organization_name=org_name,
+            service_count=int(svc_count),
+        )
+        for loc, org_name, svc_count in rows
+    ]
+    return LocationsPage(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.get("/locations/{loc_id}", response_model=LocationOut, dependencies=[Depends(require_admin)])
+async def get_location(loc_id: UUID, db: AsyncSession = Depends(get_db)) -> LocationOut:
+    loc = await db.get(Location, loc_id)
+    if not loc:
+        raise HTTPException(404, "location not found")
+    return LocationOut.model_validate(loc)
+
+
+@router.post("/locations", response_model=LocationOut, status_code=201, dependencies=[Depends(require_admin)])
+async def create_location_global(payload: LocationIn, db: AsyncSession = Depends(get_db)) -> LocationOut:
+    if payload.organization_id is None:
+        raise HTTPException(400, "organization_id is required")
+    if await db.get(Organization, payload.organization_id) is None:
+        raise HTTPException(400, f"organization {payload.organization_id} does not exist")
+    loc = Location(**payload.model_dump())
+    db.add(loc)
+    await db.commit()
+    await db.refresh(loc)
+    return LocationOut.model_validate(loc)
+
+
+
 
 
 @router.post("/organizations/{org_id}/locations", response_model=LocationOut, status_code=201, dependencies=[Depends(require_admin)])
@@ -409,6 +804,25 @@ async def update_location(loc_id: UUID, payload: LocationIn, db: AsyncSession = 
     loc = await db.get(Location, loc_id)
     if not loc:
         raise HTTPException(404, "location not found")
+
+    # Reallocating the org moves every service at this location with it.
+    # Leaving services under the old org would break the tree UI, which
+    # assumes services at a location belong to the location's org.
+    new_org_id = payload.organization_id
+    if new_org_id is not None and new_org_id != loc.organization_id:
+        if await db.get(Organization, new_org_id) is None:
+            raise HTTPException(400, f"organization {new_org_id} does not exist")
+        svc_ids = (await db.execute(
+            select(ServiceAtLocation.service_id).where(ServiceAtLocation.location_id == loc_id)
+        )).scalars().all()
+        if svc_ids:
+            await db.execute(
+                update(Service)
+                .where(Service.id.in_(svc_ids))
+                .values(organization_id=new_org_id)
+            )
+        loc.organization_id = new_org_id
+
     for k, v in payload.model_dump().items():
         if k != "organization_id":
             setattr(loc, k, v)

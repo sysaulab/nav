@@ -15,6 +15,7 @@ from .config import Settings
 from .db import get_engine, get_sessionmaker, init_engine
 from .models import Base, InterviewSession
 from .ai.registry import reload_registry
+from .runtime import reload_runtime
 from .routers import (
     admin,
     exports,
@@ -45,18 +46,33 @@ async def _purge_expired_sessions() -> int:
         if not got:
             return 0
 
-        rows = (await db.execute(
-            select(InterviewSession.id, InterviewSession.expires_at)
-        )).all()
-        expired = [row[0] for row in rows if row[1] <= now]
-        if expired:
-            await db.execute(
-                sa_delete(InterviewSession).where(InterviewSession.id.in_(expired))
-            )
+        # Push the expiry predicate into SQL. The previous shape did a
+        # full-table SELECT and filtered `expires_at <= now` in Python,
+        # so the purge walked every session row on every tick — 30 s
+        # cadence, per replica, forever. `ix_session_expires` covers the
+        # WHERE now, so this is an index range scan whose cost is
+        # proportional to the number of expired rows (usually 0–2), not
+        # to the total session count.
+        #
+        # DELETE ... RETURNING instead of SELECT-then-DELETE:
+        #   - one round-trip instead of two
+        #   - no window (however narrow) between "which rows are expired"
+        #     and "delete those rows"
+        #   - the ids the caller logs as "purged" are precisely the ids
+        #     that were removed, not a snapshot taken moments earlier
+        # Postgres has supported DELETE ... RETURNING since 8.2;
+        # SQLAlchemy's Delete has exposed .returning() since 2.0.
+        deleted_ids = (await db.execute(
+            sa_delete(InterviewSession)
+            .where(InterviewSession.expires_at <= now)
+            .returning(InterviewSession.id)
+        )).scalars().all()
+
         # Commit unconditionally: this is what releases the advisory
         # lock, even when there was nothing to delete.
         await db.commit()
-    return len(expired)
+
+    return len(deleted_ids)
 
 
 async def _purge_loop(interval: float) -> None:
@@ -109,6 +125,7 @@ def create_app(settings: Settings) -> FastAPI:
         # runs at process start.
         async with get_sessionmaker()() as db:
             await reload_registry(db, settings)
+            await reload_runtime(db, settings) 
 
         # One-time sweep at startup so restarts don't leave orphans lying around.
         purged = await _purge_expired_sessions()

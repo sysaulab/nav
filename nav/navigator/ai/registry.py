@@ -94,8 +94,13 @@ class ModelRegistry:
         for spec in db_specs.values():
             merged[spec.id] = spec
 
-        self._specs = merged
-
+        # Resolve the defaults against the *new* spec set before publishing
+        # anything. The previous shape assigned `self._specs = merged` first,
+        # then awaited two settings reads, then assigned `self._default_*`.
+        # That left a window where an in-flight chat/finalize handler could
+        # call default_chat() and hit `self._specs[self._default_chat]` with
+        # the OLD default id against the NEW specs dict — KeyError if an admin
+        # had just deleted the model that was previously the default.
         default_chat = (
             await _get_setting(db, "default.chat")
             or settings.default_chat_model_id
@@ -107,19 +112,25 @@ class ModelRegistry:
             or _HARDCODED_DEFAULT_FINALIZE
         )
 
-        if default_chat not in self._specs:
+        # Fall back when the configured default isn't in the new registry.
+        # Check `merged`, not `self._specs` — nothing has been published yet.
+        if default_chat not in merged:
             log.warning(
-                "default.chat=%r not in registry; falling back to hardcoded",
-                default_chat,
+                "default.chat=%r not in registry; falling back to hardcoded %r",
+                default_chat, _HARDCODED_DEFAULT_CHAT,
             )
             default_chat = _HARDCODED_DEFAULT_CHAT
-        if default_finalize not in self._specs:
+        if default_finalize not in merged:
             log.warning(
-                "default.finalize=%r not in registry; falling back to hardcoded",
-                default_finalize,
+                "default.finalize=%r not in registry; falling back to hardcoded %r",
+                default_finalize, _HARDCODED_DEFAULT_FINALIZE,
             )
             default_finalize = _HARDCODED_DEFAULT_FINALIZE
 
+        # Publish atomically — no awaits between these three lines. asyncio
+        # yields only at await points, so a reader sees all-old or all-new,
+        # never a mix.
+        self._specs = merged
         self._default_chat = default_chat
         self._default_finalize = default_finalize
 

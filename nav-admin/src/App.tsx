@@ -2,10 +2,13 @@ import { useState } from 'react'
 import { AuthProvider, useAuth } from './auth'
 import { ApiError } from './api'
 import Models from './pages/Models'
+import Prompt from './pages/Prompt'
 import DirectoryTree from './pages/DirectoryTree'
+import Locations from './pages/Locations'
 import Backup from './pages/Backup'
+import Account from './pages/Account'
 
-type Tab = 'directory' | 'models' | 'backup'
+type Tab = 'directory' | 'locations' | 'models' | 'prompt' | 'account' | 'backup'
 
 export default function App() {
   return (
@@ -53,6 +56,12 @@ function Shell() {
               Directory
             </NavItem>
             <NavItem
+              active={tab === 'locations'}
+              onClick={() => setTab('locations')}
+            >
+              Locations
+            </NavItem>
+            <NavItem
               active={tab === 'backup'}
               onClick={() => setTab('backup')}
             >
@@ -62,12 +71,24 @@ function Shell() {
             <NavItem active={tab === 'models'} onClick={() => setTab('models')}>
               Models
             </NavItem>
+            <NavItem active={tab === 'prompt'} onClick={() => setTab('prompt')}>
+              Prompt
+            </NavItem>
+            <NavItem
+              active={tab === 'account'}
+              onClick={() => setTab('account')}
+            >
+              Account
+            </NavItem>
           </nav>
         </aside>
         <section className="min-w-0 flex-1">
           {tab === 'directory' && <DirectoryTree />}
+          {tab === 'locations' && <Locations />}
           {tab === 'backup' && <Backup />}
           {tab === 'models' && <Models />}
+          {tab === 'prompt' && <Prompt />}
+          {tab === 'account' && <Account />}
         </section>
       </div>
     </main>

@@ -144,7 +144,7 @@ export interface ServiceCard {
     name: string
     category: string
     status: string
-    distance_km: number
+    distance_km: number | null       // ← was: number
     location_name: string | null
     address: string | null
     description: string | null

@@ -30,6 +30,8 @@ DOCX_MIME = (
 MAX_MARKDOWN_BYTES = 2 * 1024 * 1024   # 2 MiB — a plan is nowhere near this.
 MAX_IMPORT_BYTES = 100 * 1024 * 1024   # 100 MiB — matches nginx + sanitizer.
 PANDOC_TIMEOUT_S = 30.0
+MAX_PLAN_BYTES = 2 * 1024 * 1024   # 2 MiB — an action plan is nowhere near this.
+
 
 # Postgres advisory lock key for directory import. Distinct from the
 # schema-creation lock (920110) and the purge lock (920111) in
@@ -37,6 +39,14 @@ PANDOC_TIMEOUT_S = 30.0
 _IMPORT_LOCK_KEY = 920112
 
 _PANDOC = shutil.which("pandoc")
+
+
+
+
+
+class HtmlDocxIn(BaseModel):
+    html: str = Field(..., min_length=1)
+    filename: str | None = Field(default=None, max_length=120)
 
 
 # ── Markdown → DOCX ──────────────────────────────────────
@@ -53,17 +63,24 @@ def _safe_filename(name: str | None) -> str:
 
 
 @router.post("/docx")
-async def export_docx(payload: MarkdownDocxIn) -> Response:
+async def export_docx(payload: HtmlDocxIn) -> Response:
     if _PANDOC is None:
         raise HTTPException(503, "pandoc is not installed on this server")
 
-    data = payload.markdown.encode("utf-8")
-    if len(data) > MAX_MARKDOWN_BYTES:
-        raise HTTPException(413, "markdown is too large to export")
+    data = payload.html.encode("utf-8")
+    if len(data) > MAX_PLAN_BYTES:
+        raise HTTPException(413, "html is too large to export")
 
+    # Read the caller's HTML as HTML, not markdown. The UI already ran
+    # the plan through remark-gfm to render it, so the source we receive
+    # is well-formed HTML — h1/h2/p/ul/ol/li/table elements. Pandoc's
+    # markdown reader is pedantic about CommonMark edge cases (a space
+    # before "- " or "1. ", sequential ordered-list numbering) that
+    # react-markdown tolerates when it produces this HTML. The HTML
+    # reader parses the same constructs without complaint.
     proc = await asyncio.create_subprocess_exec(
         _PANDOC,
-        "-f", "markdown",
+        "-f", "html",
         "-t", "docx",
         "-o", "-",                     # force binary output to stdout
         stdin=asyncio.subprocess.PIPE,

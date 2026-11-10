@@ -7,7 +7,7 @@ export function LockOverlay() {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex cursor-pointer items-center justify-center bg-slate-100/80 backdrop-blur-xl transition-all"
+      className="fixed inset-0 z-50 flex cursor-pointer items-center justify-center backdrop-blur-[10px] transition-all"
       onClick={unlock}
     >
       <div className="rounded-2xl bg-white/90 p-8 text-center shadow-xl backdrop-blur-md">

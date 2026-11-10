@@ -89,9 +89,13 @@ export type OrganizationInput = Omit<
   'id' | 'created_at' | 'updated_at' | 'phones'
 >
 
+export type OrgOption = { id: string; name: string }
+
 export type LocationWithCount = {
   id: string
   name: string | null
+  alternate_name: string | null
+  description: string | null
   address: string | null
   latitude: string | null
   longitude: string | null
@@ -114,6 +118,20 @@ export type Location = Omit<LocationInput, 'organization_id'> & {
   organization_id: string | null
   created_at: string
   updated_at: string
+}
+
+export type LocationSearchRow = {
+  id: string
+  name: string | null
+  alternate_name: string | null
+  description: string | null
+  address: string | null
+  latitude: number | null
+  longitude: number | null
+  organization_id: string | null
+  organization_name: string | null
+  service_count: number
+  distance_km: number | null
 }
 
 export type Service = {
@@ -152,8 +170,38 @@ export type GeocodeSuggestion = {
   city: string | null
 }
 
+export type PromptNearby = {
+  radius_km: number
+  location_limit: number
+  index_limit: number
+}
+
+export type PromptState = {
+  chat_prompt: string
+  finalize_prompt: string
+  nearby: PromptNearby
+  defaults: {
+    chat_prompt: string
+    finalize_prompt: string
+    nearby: PromptNearby
+  }
+  overridden: { chat: boolean; finalize: boolean; nearby: boolean }
+}
+
 export const api = {
   health: () => request<{ ok: boolean; models: number }>('/health'),
+  auth: {
+    status: () => request<TokenStatus>('/auth/status'),
+    changeToken: (
+      current_token: string,
+      new_token: string,
+      confirm_token: string,
+    ) =>
+      request<{ ok: boolean }>('/auth/token', {
+        method: 'PUT',
+        body: JSON.stringify({ current_token, new_token, confirm_token }),
+      }),
+  },
   models: {
     list: () => request<ModelSpec[]>('/models'),
     get: (id: string) => request<ModelSpec>(`/models/${encodeURIComponent(id)}`),
@@ -175,6 +223,26 @@ export const api = {
     request<GeocodeSuggestion[]>(`/geocode/search?q=${encodeURIComponent(q)}`, {
       signal,
     }),
+  prompt: {
+    state: () => request<PromptState>('/prompt'),
+    setChat: (text: string) =>
+      request<{ ok: boolean }>('/prompt/chat', {
+        method: 'PUT',
+        body: JSON.stringify({ text }),
+      }),
+    setFinalize: (text: string) =>
+      request<{ ok: boolean }>('/prompt/finalize', {
+        method: 'PUT',
+        body: JSON.stringify({ text }),
+      }),
+    setNearby: (params: PromptNearby) =>
+      request<{ ok: boolean }>('/prompt/nearby', {
+        method: 'PUT',
+        body: JSON.stringify(params),
+      }),
+    reset: (section: 'chat' | 'finalize' | 'nearby') =>
+      request<void>(`/prompt/${section}`, { method: 'DELETE' }),
+  },
   directory: {
     orgs: {
       list: (page: number, pageSize = 50) =>
@@ -193,12 +261,18 @@ export const api = {
         }),
       remove: (id: string) =>
         request<void>(`/organizations/${id}`, { method: 'DELETE' }),
+      options: () => request<OrgOption[]>('/organizations/options'),
     },
     locations: {
       listForOrg: (orgId: string) =>
         request<LocationWithCount[]>(`/organizations/${orgId}/locations`),
       create: (orgId: string, body: LocationInput) =>
         request<Location>(`/organizations/${orgId}/locations`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
+      createGlobal: (body: LocationInput) =>
+        request<Location>('/locations', {
           method: 'POST',
           body: JSON.stringify(body),
         }),
@@ -209,6 +283,26 @@ export const api = {
         }),
       remove: (id: string) =>
         request<void>(`/locations/${id}`, { method: 'DELETE' }),
+      get: (id: string) => request<Location>(`/locations/${id}`),
+      search: (params: {
+        q?: string
+        lat?: number
+        lng?: number
+        radius_km?: number
+        page?: number
+        page_size?: number
+      }) => {
+        const p = new URLSearchParams()
+        if (params.q) p.set('q', params.q)
+        if (params.lat !== undefined) p.set('lat', String(params.lat))
+        if (params.lng !== undefined) p.set('lng', String(params.lng))
+        if (params.radius_km !== undefined)
+          p.set('radius_km', String(params.radius_km))
+        if (params.page !== undefined) p.set('page', String(params.page))
+        if (params.page_size !== undefined)
+          p.set('page_size', String(params.page_size))
+        return request<Page<LocationSearchRow>>(`/locations?${p.toString()}`)
+      },
     },
     services: {
       listForLoc: (locId: string) =>
@@ -227,7 +321,11 @@ export const api = {
         request<void>(`/services/${id}`, { method: 'DELETE' }),
     },
     phones: {
-      create: (ownerType: 'org' | 'loc' | 'svc', ownerId: string, body: PhoneInput) =>
+      create: (
+        ownerType: 'org' | 'loc' | 'svc',
+        ownerId: string,
+        body: PhoneInput,
+      ) =>
         request<Phone>(`/phones/${ownerType}/${ownerId}`, {
           method: 'POST',
           body: JSON.stringify(body),
@@ -271,4 +369,9 @@ export const api = {
       }>
     },
   },
+}
+
+export type TokenStatus = {
+  configured: boolean
+  source: 'env' | 'database' | 'none'
 }

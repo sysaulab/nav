@@ -1,5 +1,5 @@
-// web-ui/src/pages/Interview.tsx
-import { useCallback, useEffect, useState } from 'react'
+// nav-ui/src/pages/Interview.tsx
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -36,12 +36,10 @@ export default function Interview() {
   const [planning, setPlanning] = useState(false)
   const [copied, setCopied] = useState(false)
   const [exportingDocx, setExportingDocx] = useState(false)
+  const planHtmlRef = useRef<HTMLElement>(null)
 
-  // Location editing (re-open the gate mid-session)
   const [editingLocation, setEditingLocation] = useState(false)
 
-  /** Route a caught error: session-gone goes to the modal, everything else
-   * to the error banner. Returns true if it was a session error. */
   const handleApiError = useCallback((e: unknown): boolean => {
     if (isSessionError(e)) {
       setSessionExpired(true)
@@ -64,7 +62,6 @@ export default function Interview() {
     }
   }, [handleApiError])
 
-  // ── bootstrap ─────────────────────────────────────────
   useEffect(() => {
     let live = true
 
@@ -118,9 +115,8 @@ export default function Interview() {
 
     void init()
     return () => { live = false }
-  }, []) // <-- Added missing dependency array here
+  }, [])
 
-  // ── update context bar when chat/session changes ──────
   useEffect(() => {
     if (!session || streaming) return
     const messages = chat
@@ -129,9 +125,8 @@ export default function Interview() {
     api.interviews.contextPrompt(session.id, messages)
       .then(setContext)
       .catch(() => {})
-  }, [chat, session, streaming]) // <-- Moved out of the bootstrap effect
+  }, [chat, session, streaming])
 
-  // ── upload ────────────────────────────────────────────
   const ACCEPT =
     '.rtf,.pdf,.txt,.md,.docx,.odt,.ods,.odp,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.pptx'
 
@@ -254,7 +249,6 @@ export default function Interview() {
     }
   }
 
-  // ── chat ──────────────────────────────────────────────
   async function send() {
     if (!session || !input.trim() || streaming) return
     const userMsg: ChatMessage = { role: 'user', content: input.trim() }
@@ -314,7 +308,6 @@ export default function Interview() {
     }
   }
 
-  // ── finalize ──────────────────────────────────────────
   async function finalize() {
     if (!session || planning || streaming) return
     const priorMessages: ChatMessage[] = chat
@@ -341,11 +334,29 @@ export default function Interview() {
     }
   }
 
-  // ── plan actions ──────────────────────────────────────
+  function getPlanHtml(): string {
+    return planHtmlRef.current?.innerHTML ?? ''
+  }
+
   async function copyPlan() {
     if (plan === null || !plan) return
+    const html = getPlanHtml()
+    if (!html) {
+      setError('Plan is still rendering; try again in a moment.')
+      return
+    }
+
     try {
-      await navigator.clipboard.writeText(plan)
+      if (typeof ClipboardItem !== 'undefined' && navigator.clipboard.write) {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([html], { type: 'text/html' }),
+            'text/plain': new Blob([plan], { type: 'text/plain' }),
+          }),
+        ])
+      } else {
+        await navigator.clipboard.writeText(plan)
+      }
     } catch {
       const ta = document.createElement('textarea')
       ta.value = plan
@@ -356,6 +367,7 @@ export default function Interview() {
       try { document.execCommand('copy') } catch { /* ignore */ }
       ta.remove()
     }
+
     setCopied(true)
     window.setTimeout(() => setCopied(false), 1500)
   }
@@ -375,6 +387,12 @@ export default function Interview() {
 
   async function downloadDocx() {
     if (!plan) return
+    const html = getPlanHtml()
+    if (!html) {
+      setError('Plan is still rendering; try again in a moment.')
+      return
+    }
+
     setExportingDocx(true)
     setError(null)
     const stem = `action-plan-${session?.id.slice(0, 8) ?? 'session'}`
@@ -382,7 +400,7 @@ export default function Interview() {
       const res = await fetch('/api/export/docx', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ markdown: plan, filename: stem }),
+        body: JSON.stringify({ html, filename: stem }),
       })
       if (!res.ok) throw new Error(await res.text())
       const blob = await res.blob()
@@ -401,7 +419,6 @@ export default function Interview() {
     }
   }
 
-  // ── render ────────────────────────────────────────────
   if (sessionExpired) {
     return <SessionExpiredModal />
   }
@@ -420,7 +437,6 @@ export default function Interview() {
     )
   }
 
-  // ── Location gate: first-time entry OR mid-session edit ──
   if (!session.postal_code || editingLocation) {
     return (
       <LocationGate
@@ -541,7 +557,10 @@ export default function Interview() {
             </div>
 
             {plan ? (
-              <article className="prose prose-sm prose-slate mt-3 max-w-none prose-headings:font-semibold prose-headings:text-slate-900 prose-a:text-emerald-700 prose-code:text-emerald-800 prose-pre:bg-slate-900">
+              <article
+                ref={planHtmlRef}
+                className="prose prose-sm prose-slate mt-3 max-w-none prose-headings:font-semibold prose-headings:text-slate-900 prose-a:text-emerald-700 prose-code:text-emerald-800 prose-pre:bg-slate-900"
+              >
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan}</ReactMarkdown>
               </article>
             ) : (
@@ -769,9 +788,6 @@ export default function Interview() {
   )
 }
 
-// ─────────────────────────────────────────────────────────────
-// Session expired modal
-// ─────────────────────────────────────────────────────────────
 function SessionExpiredModal() {
   return (
     <main className="flex min-h-screen items-center justify-center bg-slate-50 p-8">
@@ -814,9 +830,6 @@ function SessionExpiredModal() {
   )
 }
 
-// ─────────────────────────────────────────────────────────────
-// Location gate
-// ─────────────────────────────────────────────────────────────
 function LocationGate({
   session,
   onLocated,
@@ -855,7 +868,7 @@ function LocationGate({
       setBusy(false)
     }
   }
-  
+
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     if (busy) return
@@ -928,20 +941,25 @@ function LocationGate({
   )
 }
 
-// ─────────────────────────────────────────────────────────────
-// Service card rendered inline in the chat flow
-// ─────────────────────────────────────────────────────────────
 function ServiceCardView({ card }: { card: ServiceCard }) {
   const s = card.service
   const [copied, setCopied] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+
+  const distLabel =
+    s.distance_km !== null ? `${s.distance_km.toFixed(1)}km` : 'Global'
+
+  // Hover tooltip on the truncated location name so the full place —
+  // name and address — is still discoverable without expanding.
+  const tooltip =
+    [s.location_name, s.address].filter(Boolean).join(' — ') || undefined
 
   async function copyCard() {
-    const lines: string[] = [
-      `${s.category} — ${s.distance_km.toFixed(1)} km`,
-      s.name,
-    ]
-    const place = [s.location_name, s.address].filter(Boolean).join(' — ')
-    if (place) lines.push(place)
+    const distStr =
+      s.distance_km !== null ? `${s.distance_km.toFixed(1)} km` : 'Global'
+    const lines: string[] = [`${s.category} — ${distStr}`, s.name]
+    const placeStr = [s.location_name, s.address].filter(Boolean).join(' — ')
+    if (placeStr) lines.push(placeStr)
     if (s.description) lines.push(s.description)
     if (s.eligibility_description) lines.push(`Eligibility: ${s.eligibility_description}`)
     if (s.application_process) lines.push(`How to apply: ${s.application_process}`)
@@ -967,73 +985,100 @@ function ServiceCardView({ card }: { card: ServiceCard }) {
   }
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="flex items-baseline justify-between gap-3">
-        <div className="flex items-baseline gap-2">
-          <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600">
-            [{String(card.index).padStart(2, '0')}]
-          </span>
-          <span className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
-            {s.category}
-          </span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-500">{s.distance_km.toFixed(1)} km</span>
-          <button
-            type="button"
-            onClick={() => void copyCard()}
-            className="rounded-md border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-slate-50"
-            aria-live="polite"
-          >
-            {copied ? 'Copied!' : 'Copy'}
-          </button>
-        </div>
-      </div>
-      <h3 className="mt-1 text-base font-semibold text-slate-900">{s.name}</h3>
-      {(s.location_name || s.address) && (
-        <p className="text-xs text-slate-600">
-          {s.location_name}
-          {s.location_name && s.address ? ' — ' : ''}
-          {s.address}
-        </p>
-      )}
-      {s.description && (
-        <p className="mt-2 text-sm text-slate-700">{s.description}</p>
-      )}
-      {s.eligibility_description && (
-        <p className="mt-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Eligibility:</span>{' '}
-          {s.eligibility_description}
-        </p>
-      )}
-      {s.application_process && (
-        <p className="mt-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">How to apply:</span>{' '}
-          {s.application_process}
-        </p>
-      )}
-      {s.fees_description && (
-        <p className="mt-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Fees:</span>{' '}
-          {s.fees_description}
-        </p>
-      )}
-      {(s.email || s.url) && (
-        <div className="mt-2 flex flex-wrap gap-3 text-xs">
-          {s.email && (
-            <a href={`mailto:${s.email}`} className="text-emerald-700 hover:underline">
-              {s.email}
-            </a>
-          )}
-          {s.url && (
-            <a
-              href={s.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-emerald-700 hover:underline"
+    <div className="min-w-0 max-w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+      {/* One-line header. Every fixed element is shrink-0, so only the
+          location name can absorb width — and it truncates with an
+          ellipsis the moment the container narrows below its natural
+          width. min-w-0 + overflow-hidden at every flex boundary is
+          what actually allows `truncate` to fire inside a flex context. */}
+      <div className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden px-3 py-2 text-sm">
+        <button
+          type="button"
+          onClick={() => setExpanded((e) => !e)}
+          className="shrink-0 rounded px-1 font-mono text-[11px] leading-none text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+          aria-label={expanded ? 'Collapse details' : 'Expand details'}
+          aria-expanded={expanded}
+        >
+          {expanded ? '[-]' : '[+]'}
+        </button>
+        <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600">
+          {s.category}
+        </span>
+        <span className="shrink-0 text-xs text-slate-500">{distLabel}</span>
+        {s.location_name && (
+          <>
+            <span className="shrink-0 text-slate-400">—</span>
+            <span
+              className="min-w-0 flex-1 truncate text-sm text-slate-700"
+              title={tooltip}
             >
-              {s.url}
-            </a>
+              {s.location_name}
+            </span>
+          </>
+        )}
+        {!s.location_name && <span className="min-w-0 flex-1" />}
+        <button
+          type="button"
+          onClick={() => void copyCard()}
+          className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-slate-50"
+          aria-live="polite"
+        >
+          {copied ? 'Copied!' : 'Copy'}
+        </button>
+      </div>
+
+      {expanded && (
+        <div className="space-y-2 border-t border-slate-200 px-4 py-3">
+          <h3 className="text-base font-semibold text-slate-900">{s.name}</h3>
+          {(s.location_name || s.address) && (
+            <p className="text-xs text-slate-600">
+              {s.location_name}
+              {s.location_name && s.address ? ' — ' : ''}
+              {s.address}
+            </p>
+          )}
+          {s.description && (
+            <p className="text-sm text-slate-700">{s.description}</p>
+          )}
+          {s.eligibility_description && (
+            <p className="text-xs text-slate-600">
+              <span className="font-medium text-slate-700">Eligibility:</span>{' '}
+              {s.eligibility_description}
+            </p>
+          )}
+          {s.application_process && (
+            <p className="text-xs text-slate-600">
+              <span className="font-medium text-slate-700">How to apply:</span>{' '}
+              {s.application_process}
+            </p>
+          )}
+          {s.fees_description && (
+            <p className="text-xs text-slate-600">
+              <span className="font-medium text-slate-700">Fees:</span>{' '}
+              {s.fees_description}
+            </p>
+          )}
+          {(s.email || s.url) && (
+            <div className="flex flex-wrap gap-3 pt-1 text-xs">
+              {s.email && (
+                <a
+                  href={`mailto:${s.email}`}
+                  className="text-emerald-700 hover:underline"
+                >
+                  {s.email}
+                </a>
+              )}
+              {s.url && (
+                <a
+                  href={s.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-emerald-700 hover:underline"
+                >
+                  {s.url}
+                </a>
+              )}
+            </div>
           )}
         </div>
       )}

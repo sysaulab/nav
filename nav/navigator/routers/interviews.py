@@ -70,7 +70,8 @@ from ..db import get_db
 from ..models import (
     InterviewSession, Location, Service, ServiceAtLocation, SessionDocument,
 )
-from ..prompt import BASE_SYSTEM_PROMPT, assemble_prompt, render_document
+from ..prompt import assemble_prompt, render_document
+from ..runtime import get_runtime
 from ..sanitize import filter_sanitizer_output
 from ..schemas import (
     ChatRequestIn,
@@ -263,9 +264,9 @@ async def set_location(
     sess.origin_lng = lng
     sess.origin_display_name = display_name[:512]
 
+    n = get_runtime().current().nearby
     rows = await _nearby_services(
-        db, lat, lng, cfg.postcode_radius_km,
-        cfg.nearby_location_limit, cfg.nearby_index_limit,
+        db, lat, lng, n.radius_km, n.location_limit, n.index_limit,
     )
     sess.nearby_service_ids = [str(svc.id) for svc, _l, _d in rows]
     sess.revealed_service_indices = []
@@ -427,23 +428,28 @@ async def _closest_location_per_service(
     service_ids: list[UUID],
     origin_lat: float,
     origin_lng: float,
-) -> dict[UUID, tuple[Location, float]]:
+) -> dict[UUID, tuple[Location, float | None]]:
     if not service_ids:
         return {}
     loc_rows = (await db.execute(
         select(ServiceAtLocation.service_id, Location)
         .join(Location, Location.id == ServiceAtLocation.location_id)
         .where(ServiceAtLocation.service_id.in_(service_ids))
-        .where(Location.latitude.isnot(None), Location.longitude.isnot(None))
     )).all()
-    result: dict[UUID, tuple[Location, float]] = {}
+    result: dict[UUID, tuple[Location, float | None]] = {}
     for sal_sid, loc in loc_rows:
+        if loc.latitude is None or loc.longitude is None:
+            # Global — takes precedence over any local location.
+            result[sal_sid] = (loc, None)
+            continue
         d = _haversine_km(
             origin_lat, origin_lng,
             float(loc.latitude), float(loc.longitude),
         )
         prev = result.get(sal_sid)
-        if prev is None or d < prev[1]:
+        if prev is None:
+            result[sal_sid] = (loc, d)
+        elif prev[1] is not None and d < prev[1]:
             result[sal_sid] = (loc, d)
     return result
 
@@ -455,35 +461,48 @@ async def _nearby_services(
     radius_km: float,
     location_limit: int,
     index_limit: int,
-) -> list[tuple[Service, Location, float]]:
+) -> list[tuple[Service, Location, float | None]]:
     lat0, lng0 = float(lat), float(lng)
-    deg_pad = radius_km * _DEG_PER_KM
+
+    deg_pad_lat = radius_km * _DEG_PER_KM
+    cos_lat = max(math.cos(math.radians(lat0)), 0.01)
+    deg_pad_lng = radius_km * _DEG_PER_KM / cos_lat
+
+    # No coordinate predicate in SQL — NULL-coord rows are global services
+    # (crisis lines, province-wide info lines) that apply to every
+    # customer. They rank first in the result. Coordinates are only used
+    # for the *local* bucket; the haversine filter below drops locals
+    # outside radius_km.
     stmt = (
         select(Service, Location)
         .join(ServiceAtLocation, ServiceAtLocation.service_id == Service.id)
         .join(Location, Location.id == ServiceAtLocation.location_id)
-        .where(
-            Location.latitude.isnot(None),
-            Location.longitude.isnot(None),
-            Location.latitude.between(lat0 - deg_pad, lat0 + deg_pad),
-            Location.longitude.between(lng0 - deg_pad, lng0 + deg_pad),
-            Service.status == "active",
-        )
+        .where(Service.status == "active")
     )
     rows = (await db.execute(stmt)).all()
 
-    by_service: dict[UUID, tuple[Service, Location, float]] = {}
+    # Per-service: (Service, Location, distance_or_None).
+    # Global (NULL coords) takes precedence over any local.
+    by_service: dict[UUID, tuple[Service, Location, float | None]] = {}
     for svc, loc in rows:
-        if loc.latitude is None or loc.longitude is None:
+        is_global = loc.latitude is None or loc.longitude is None
+        if is_global:
+            existing = by_service.get(svc.id)
+            if existing is None or existing[2] is not None:
+                by_service[svc.id] = (svc, loc, None)
             continue
+
         d = _haversine_km(lat0, lng0, float(loc.latitude), float(loc.longitude))
         if d > radius_km:
             continue
-        prev = by_service.get(svc.id)
-        if prev is None or d < prev[2]:
+        existing = by_service.get(svc.id)
+        if existing is None:
+            by_service[svc.id] = (svc, loc, d)
+        elif existing[2] is not None and d < existing[2]:
             by_service[svc.id] = (svc, loc, d)
 
-    by_location: dict[UUID, tuple[Location, float, list[Service]]] = {}
+    # Group by location.
+    by_location: dict[UUID, tuple[Location, float | None, list[Service]]] = {}
     for svc, loc, d in by_service.values():
         entry = by_location.get(loc.id)
         if entry is None:
@@ -491,16 +510,29 @@ async def _nearby_services(
         else:
             entry[2].append(svc)
 
-    sorted_locs = sorted(by_location.values(), key=lambda t: t[1])[:location_limit]
+    global_locs = [v for v in by_location.values() if v[1] is None]
+    local_locs = [v for v in by_location.values() if v[1] is not None]
 
-    result: list[tuple[Service, Location, float]] = []
-    for loc, d, svcs in sorted_locs:
+    global_locs.sort(key=lambda t: (t[0].name or "").lower())
+    local_locs.sort(key=lambda t: t[1])
+    local_locs = local_locs[:location_limit]
+
+    # Globals first — they apply everywhere, so they must appear before
+    # any distance-sorted local entry. They do NOT consume location_limit
+    # (that cap is "how many physical places to show"); they only count
+    # against index_limit, which is the total services budget.
+    result: list[tuple[Service, Location, float | None]] = []
+    for loc, _d, svcs in global_locs:
+        for svc in sorted(svcs, key=lambda s: (s.name or "").lower()):
+            result.append((svc, loc, None))
+            if len(result) >= index_limit:
+                return result
+    for loc, d, svcs in local_locs:
         for svc in sorted(svcs, key=lambda s: (s.name or "").lower()):
             result.append((svc, loc, d))
             if len(result) >= index_limit:
                 return result
     return result
-
 
 _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "SHELTER":     ("shelter", "housing", "homeless", "residence", "hostel"),
@@ -526,17 +558,20 @@ def _category_of(svc: Service) -> str:
 
 
 def _render_service_full(
-    idx: int, svc: Service, loc: Location | None, dist_km: float,
+    idx: int, svc: Service, loc: Location | None, dist_km: float | None,
 ) -> str:
     cat = _category_of(svc)
-    lines = [f"\n### [{idx:02d}] {cat} — {dist_km:.1f} km", f"**{svc.name}**"]
+    dist_label = f"{dist_km:.1f} km" if dist_km is not None else "Global"
+    lines = [f"\n### [{idx:02d}] {cat} — {dist_label}", f"**{svc.name}**"]
+
     if loc:
-        addr = loc.address or (
-            f"{loc.latitude}, {loc.longitude}"
-            if loc.latitude is not None and loc.longitude is not None
-            else "(no address)"
-        )
-        lines.append(f"- Location: {loc.name or '(unnamed)'} — {addr}")
+        if loc.latitude is not None and loc.longitude is not None:
+            addr = loc.address or f"{loc.latitude}, {loc.longitude}"
+            lines.append(f"- Location: {loc.name or '(unnamed)'} — {addr}")
+        elif loc.name or loc.address:
+            parts = [p for p in (loc.name, loc.address) if p]
+            lines.append(f"- Location: {' — '.join(parts)}")
+
     if svc.description:
         lines.append(f"- {svc.description[:500]}")
     if svc.eligibility_description:
@@ -553,32 +588,67 @@ def _render_service_full(
 
 
 def _render_nearby(
-    items: list[tuple[int, Service | None, Location | None, float]],
+    items: list[tuple[int, Service | None, Location | None, float | None]],
     postal_code: str,
     display_name: str | None,
     revealed: set[int],
 ) -> str:
-    header = f"## Customer location\n{display_name or postal_code}"
-    if display_name:
-        header += f" — {display_name}"
+    loc = postal_code or "unknown"
+    if display_name and display_name != loc:
+        loc = f"{loc} — {display_name}"
+    header = f"## Customer location\n{loc}"
     if not items:
         return header + "\n\nNo services were found near this location."
 
-    lines = [header, "", "## Nearby services"]
-    current_loc_id: UUID | None = None
-    for idx, svc, loc, dist in items:
-        if loc is None:
-            lines.append(f"[{idx:02d}] (no longer available)")
-            continue
-        if loc.id != current_loc_id:
-            if current_loc_id is not None:
-                lines.append("")
-            name = loc.name or "(unnamed location)"
-            lines.append(f"{name} ({dist:.1f}km away)")
-            if loc.address:
-                lines.append(loc.address)
-            current_loc_id = loc.id
-        lines.append(f"[{idx:02d}] {svc.name if svc else '(unavailable)'}")
+    # Split by distance presence. Globals (dist None, svc present) come
+    # first, because they apply everywhere. Orphans (svc None) land in
+    # the local bucket when their sentinel is 0.0, or in globals when
+    # their sentinel is None; either way they render as
+    # "(no longer available)" and are not treated as a real entry.
+    globals_items: list = []
+    locals_items: list = []
+    for it in items:
+        if it[3] is None:
+            globals_items.append(it)
+        else:
+            locals_items.append(it)
+
+    lines = [header]
+
+    if globals_items:
+        lines.append("")
+        lines.append("## Global services (apply everywhere)")
+        current_loc_id: UUID | None = None
+        for idx, svc, loc_obj, _d in globals_items:
+            if svc is None or loc_obj is None:
+                lines.append(f"[{idx:02d}] (no longer available)")
+                continue
+            if loc_obj.id != current_loc_id:
+                if current_loc_id is not None:
+                    lines.append("")
+                lines.append(loc_obj.name or "(unnamed location)")
+                if loc_obj.address:
+                    lines.append(loc_obj.address)
+                current_loc_id = loc_obj.id
+            lines.append(f"[{idx:02d}] {svc.name}")
+
+    if locals_items:
+        lines.append("")
+        lines.append("## Nearby services")
+        current_loc_id = None
+        for idx, svc, loc_obj, dist in locals_items:
+            if svc is None or loc_obj is None:
+                lines.append(f"[{idx:02d}] (no longer available)")
+                continue
+            if loc_obj.id != current_loc_id:
+                if current_loc_id is not None:
+                    lines.append("")
+                name = loc_obj.name or "(unnamed location)"
+                lines.append(f"{name} ({dist:.1f}km away)")
+                if loc_obj.address:
+                    lines.append(loc_obj.address)
+                current_loc_id = loc_obj.id
+            lines.append(f"[{idx:02d}] {svc.name}")
 
     lines.append(
         "\nCall `get_service_details(n)` to expand any service. "
@@ -592,11 +662,11 @@ def _render_nearby(
         for i in sorted(revealed):
             if i < 0 or i >= len(items):
                 continue
-            idx, svc, loc, d = items[i]
+            idx, svc, loc_obj, d = items[i]
             if svc is None:
                 lines.append(f"\n### [{idx:02d}] (no longer available)")
             else:
-                lines.append(_render_service_full(idx, svc, loc, d))
+                lines.append(_render_service_full(idx, svc, loc_obj, d))
 
     return "\n".join(lines)
 
@@ -624,11 +694,11 @@ def _parse_index(raw) -> int | None:
 
 async def _lookup_location_and_distance(
     db: AsyncSession, svc: Service, sess: InterviewSession,
-) -> tuple[Location | None, float]:
+) -> tuple[Location | None, float | None]:
     origin_lat = float(sess.origin_lat) if sess.origin_lat is not None else 0.0
     origin_lng = float(sess.origin_lng) if sess.origin_lng is not None else 0.0
     hits = await _closest_location_per_service(db, [svc.id], origin_lat, origin_lng)
-    return hits.get(svc.id, (None, 0.0))
+    return hits.get(svc.id, (None, None))
 
 
 async def _fetch_nearby_by_ids(
@@ -658,19 +728,19 @@ async def _fetch_nearby_by_ids(
         db, list(services.keys()), origin_lat, origin_lng,
     )
 
-    out: list[tuple[int, Service | None, Location | None, float]] = []
+    out: list[tuple[int, Service | None, Location | None, float | None]] = []
     for idx, u in enumerate(uuids):
         if u is None or u not in services:
-            out.append((idx, None, None, 0.0))
+            out.append((idx, None, None, None))
             continue
         svc = services[u]
-        loc, dist = locs_by_svc.get(u, (None, 0.0))
+        loc, dist = locs_by_svc.get(u, (None, None))
         out.append((idx, svc, loc, dist))
     return out
 
 
 def _card_payload(
-    idx: int, svc: Service, loc: Location | None, dist_km: float,
+    idx: int, svc: Service, loc: Location | None, dist_km: float | None,
 ) -> dict:
     return {
         "index": idx,
@@ -679,7 +749,7 @@ def _card_payload(
             "name": svc.name,
             "category": _category_of(svc),
             "status": svc.status,
-            "distance_km": round(dist_km, 2),
+            "distance_km": round(dist_km, 2) if dist_km is not None else None,
             "location_name": loc.name if loc else None,
             "address": loc.address if loc else None,
             "description": svc.description,
@@ -766,8 +836,10 @@ def _render_session_context(sess: InterviewSession) -> str:
 
 
 async def _build_chat_context(
-    sid: UUID, db: AsyncSession, base: str = BASE_SYSTEM_PROMPT
+    sid: UUID, db: AsyncSession, base: str | None = None
 ):
+    if base is None:
+        base = get_runtime().current().chat_prompt
     cfg = _cfg()
     sess = await db.get(InterviewSession, sid)
     docs = (await db.execute(
@@ -813,10 +885,10 @@ async def _build_chat_context(
     if sess and sess.origin_lat is not None and sess.origin_lng is not None:
         items = await _fetch_nearby_by_ids(db, sess.nearby_service_ids or [], sess)
         if not items:
+            n = get_runtime().current().nearby
             rows = await _nearby_services(
                 db, sess.origin_lat, sess.origin_lng,
-                cfg.postcode_radius_km,
-                cfg.nearby_location_limit, cfg.nearby_index_limit,
+                n.radius_km, n.location_limit, n.index_limit,
             )
             sess.nearby_service_ids = [str(svc.id) for svc, _l, _d in rows]
             await db.commit()
@@ -993,22 +1065,6 @@ async def chat(
 
 # ── final plan ───────────────────────────────────────────
 
-FINALIZE_SYSTEM_PROMPT = (
-    "You are a caseworker assistant finalizing an intake. The customer has "
-    "finished the conversation and is ready for a concrete plan of action. "
-    "Below are their documents, the services near their postal code, and the "
-    "conversation so far.\n\n"
-    "Produce, in this order:\n"
-    "1. A 2–3 sentence summary of the situation.\n"
-    "2. Numbered, prioritized next steps (do first → do later).\n"
-    "3. Specific referrals to nearby services — cite by name and location, "
-    "using ONLY services from the 'Nearby services' list. If none fit, say so.\n"
-    "4. Documents to bring and follow-ups to expect.\n\n"
-    "Cite document blocks by their `pN_bM` IDs where it strengthens a claim. "
-    "Do not invent services, addresses, or eligibility rules. Be concise, "
-    "warm, and specific."
-)
-
 
 @router.post("/{sid}/finalize")
 async def finalize(
@@ -1022,7 +1078,7 @@ async def finalize(
     spec = get_registry().default_finalize()
 
     system_prompt, _included, _skipped, _used = await _build_chat_context(
-        sid, db, base=FINALIZE_SYSTEM_PROMPT
+        sid, db, base=get_runtime().current().finalize_prompt
     )
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
