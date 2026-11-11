@@ -318,10 +318,13 @@ export const api = {
 
   directory: {
     orgs: {
-      list: (page: number, pageSize = 50) =>
-        request<Page<Organization>>(
-          `/organizations?page=${page}&page_size=${pageSize}`,
-        ),
+      list: (page: number, pageSize = 50, q?: string) => {
+        const p = new URLSearchParams()
+        p.set('page', String(page))
+        p.set('page_size', String(pageSize))
+        if (q) p.set('q', q)
+        return request<Page<Organization>>(`/organizations?${p.toString()}`)
+      },
       create: (body: OrganizationInput) =>
         request<Organization>('/organizations', {
           method: 'POST',

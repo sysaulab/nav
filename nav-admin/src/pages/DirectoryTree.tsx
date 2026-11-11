@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   api,
   ApiError,
@@ -9,14 +9,22 @@ import {
 import { DirectoryModals } from '../components/DirectoryModals'
 import { PhoneList } from '../components/PhoneList'
 
-const PAGE_SIZE = 50
+const PAGE_SIZE = 10
+const NAME_DEBOUNCE_MS = 333
+const NAME_MIN_CHARS = 3
 
 export default function DirectoryTree() {
   const [page, setPage] = useState(1)
+  const [nameQuery, setNameQuery] = useState('')
   const [orgs, setOrgs] = useState<Organization[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const effectiveQ =
+    nameQuery.trim().length >= NAME_MIN_CHARS
+      ? nameQuery.trim()
+      : undefined
 
   const [expandedOrgs, setExpandedOrgs] = useState<Set<string>>(new Set())
   const [expandedLocs, setExpandedLocs] = useState<Set<string>>(new Set())
@@ -33,11 +41,11 @@ export default function DirectoryTree() {
 
   // ── data loading ─────────────────────────────────────
 
-  const loadOrgs = useCallback(async (p: number) => {
+  const loadOrgs = useCallback(async (p: number, q?: string) => {
     setLoading(true)
     setError(null)
     try {
-      const result = await api.directory.orgs.list(p, PAGE_SIZE)
+      const result = await api.directory.orgs.list(p, PAGE_SIZE, q)
       setOrgs(result.items)
       setTotal(result.total)
     } catch (e) {
@@ -47,9 +55,15 @@ export default function DirectoryTree() {
     }
   }, [])
 
+  const firstRunRef = useRef(true)
   useEffect(() => {
-    void loadOrgs(page)
-  }, [page, loadOrgs])
+    const delay = firstRunRef.current ? 0 : NAME_DEBOUNCE_MS
+    firstRunRef.current = false
+    const t = window.setTimeout(() => {
+      void loadOrgs(page, effectiveQ)
+    }, delay)
+    return () => window.clearTimeout(t)
+  }, [page, effectiveQ, loadOrgs])
 
   const refreshLocsForOrg = useCallback(async (orgId: string) => {
     try {
@@ -116,7 +130,7 @@ export default function DirectoryTree() {
         delete n[org.id]
         return n
       })
-      await loadOrgs(page)
+      await loadOrgs(page, effectiveQ)
     } catch (e) {
       alert((e as Error).message)
     }
@@ -160,6 +174,8 @@ export default function DirectoryTree() {
   // ── render ───────────────────────────────────────────
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const nameCharsShort =
+    nameQuery.length > 0 && nameQuery.trim().length < NAME_MIN_CHARS
 
   return (
     <div>
@@ -167,7 +183,8 @@ export default function DirectoryTree() {
         <div>
           <h2 className="text-lg font-medium text-slate-900">Directory</h2>
           <p className="mt-0.5 text-xs text-slate-500">
-            {total.toLocaleString()} organizations
+            {total.toLocaleString()} organization{total === 1 ? '' : 's'}
+            {effectiveQ ? ` · matching "${effectiveQ}"` : ''}
           </p>
         </div>
         <button
@@ -176,6 +193,30 @@ export default function DirectoryTree() {
         >
           New Organization
         </button>
+      </div>
+
+      <div className="mb-4 rounded-xl border border-slate-200 bg-white p-4">
+        <label className="block">
+          <span className="mb-1 block text-[11px] uppercase tracking-wide text-slate-500">
+            Filter by name
+          </span>
+          <input
+            value={nameQuery}
+            onChange={(e) => {
+              setNameQuery(e.target.value)
+              setPage(1)
+            }}
+            placeholder="Name or alternate name…"
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-slate-500 focus:outline-none"
+          />
+          {nameCharsShort && (
+            <span className="mt-1 block text-[11px] text-slate-500">
+              Type {NAME_MIN_CHARS - nameQuery.trim().length} more character
+              {NAME_MIN_CHARS - nameQuery.trim().length === 1 ? '' : 's'} to
+              start filtering
+            </span>
+          )}
+        </label>
       </div>
 
       {error && (
@@ -190,7 +231,7 @@ export default function DirectoryTree() {
         )}
         {!loading && orgs.length === 0 && (
           <div className="py-8 text-center text-sm text-slate-500">
-            No organizations yet.
+            {effectiveQ ? 'No organizations match.' : 'No organizations yet.'}
           </div>
         )}
 
@@ -222,7 +263,7 @@ export default function DirectoryTree() {
                       ownerType="org"
                       ownerId={org.id}
                       phones={org.phones || []}
-                      onRefresh={() => void loadOrgs(page)}
+                      onRefresh={() => void loadOrgs(page, effectiveQ)}
                       theme="dark"
                     />
                   </div>
@@ -450,12 +491,11 @@ export default function DirectoryTree() {
             const closed = modalState
             setModalState(null)
             if (closed.type === 'org') {
-              await loadOrgs(page)
+              await loadOrgs(page, effectiveQ)
             } else if (closed.type === 'loc') {
               await refreshLocsForOrg(closed.orgId)
             } else if (closed.type === 'svc') {
               await refreshSvcsForLoc(closed.locId)
-              // Service count on the parent location may have changed
               const orgId = Object.keys(locationsByOrg).find((k) =>
                 locationsByOrg[k].some((l) => l.id === closed.locId),
               )

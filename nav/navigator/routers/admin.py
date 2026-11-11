@@ -483,16 +483,26 @@ class OrganizationsPage(BaseModel):
 @router.get("/organizations", dependencies=[Depends(require_admin)])
 async def list_organizations(
     db: AsyncSession = Depends(get_db),
+    q: str | None = Query(
+        None, description="Partial match on name or alternate name",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
 ) -> OrganizationsPage:
+    base = select(Organization)
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        base = base.where(
+            Organization.name.ilike(like)
+            | Organization.alternate_name.ilike(like)
+        )
+
     total = (await db.execute(
-        select(func.count()).select_from(Organization)
+        select(func.count()).select_from(base.subquery())
     )).scalar() or 0
 
     rows = (await db.execute(
-        select(Organization)
-        .order_by(Organization.name)
+        base.order_by(Organization.name)
         .offset((page - 1) * page_size)
         .limit(page_size)
     )).scalars().all()
@@ -509,7 +519,6 @@ async def list_organizations(
         items=items,
         total=total, page=page, page_size=page_size,
     )
-
 
 @router.post("/organizations", response_model=OrganizationOut, status_code=201, dependencies=[Depends(require_admin)])
 async def create_organization(payload: OrganizationIn, db: AsyncSession = Depends(get_db)) -> OrganizationOut:
