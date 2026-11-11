@@ -22,6 +22,8 @@ ENGLISH_STRINGS: dict[str, str] = {
     "welcome.address_placeholder": "e.g. M5V 2T6 or 123 Queen St W",
     "welcome.start": "Start Session",
     "welcome.privacy_note": "Sessions time out after 15 minutes of inactivity during chat or upload. Everything is wiped when the session ends.",
+    "welcome.choose_language": "Choose your language",
+    "welcome.change_language": "← Change language",
 
     # ── Location gate ────────────────────────────────────
     "location.title": "Where are you located?",
@@ -69,6 +71,11 @@ ENGLISH_STRINGS: dict[str, str] = {
     "documents.status_ready": "ready · {k}k tok",
     "documents.status_ready_skipped": "ready · skipped (budget)",
     "documents.status_skipped_too_large": "skipped — too large",
+    "documents.status_quarantine": "quarantine",
+    "documents.status_failed": "failed",
+    "documents.error_unsupported_type": "Unsupported file type. Accepted: PDF, Office (OOXML), images, plain text.",
+    "documents.error_skipped_count": "{n} file(s) skipped — unsupported type",
+    "documents.error_legacy_office": "{filename}: {ext} (Office 97-2003) is not supported — re-save as {replacement} and re-upload.",
 
     # ── Context budget ───────────────────────────────────
     "context.title": "Context budget",
@@ -99,6 +106,11 @@ ENGLISH_STRINGS: dict[str, str] = {
     "card.email": "Email:",
     "card.url": "URL:",
 
+    # ── Confirmations ────────────────────────────────────
+    "confirm.end_session": "End this session? Documents and chat history will be discarded.",
+    "confirm.end_session_yes": "End session",
+    "confirm.cancel": "Cancel",
+
     # ── Categories (from interviews._category_of) ────────
     "category.SHELTER": "SHELTER",
     "category.FOOD": "FOOD",
@@ -116,21 +128,33 @@ ENGLISH_STRINGS: dict[str, str] = {
 
 # Optional context hints — the translator uses these to pick register.
 # Only populated for strings where the meaning is genuinely ambiguous.
+#
+# INVARIANT: every value must fit in VARCHAR(50) — the UiString.context
+# column limit. A longer value fails at startup, since _sync_ui_strings()
+# runs inside the FastAPI lifespan handler before the app serves traffic.
+# create_all() does not ALTER existing tables, so raising the model column
+# to VARCHAR(255) would require an explicit ALTER TABLE against the live
+# schema. Keep the hints terse. (Current longest: 49 chars.)
 CONTEXTS: dict[str, str] = {
-    "welcome.title":         "page heading",
-    "welcome.start":         "button label, primary action",
-    "location.continue":     "button label",
-    "interview.finish":      "button label, ends session with a plan",
-    "interview.end_session": "button label, abandons session",
-    "chat.send":             "button label",
-    "chat.type_message":     "form input placeholder",
-    "plan.copy":             "button label",
-    "plan.copied":           "confirmation after action, keep exclamation",
-    "plan.regenerate":       "button label, produces a fresh plan",
-    "documents.remove":      "small inline link, verb",
-    "session.expired_title": "page heading, status not imperative",
-    "clock.session":         "label on a status badge",
-    "clock.session_ending":  "label on a status badge, urgent tone",
-    "card.eligibility":      "field label before a value",
-    "card.application":      "field label before a value",
+    "welcome.title":           "page heading",
+    "welcome.start":           "button label, primary action",
+    "welcome.choose_language": "page heading on the kiosk language picker",
+    "welcome.change_language": "small inline link, returns to the language picker",
+    "location.continue":       "button label",
+    "interview.finish":        "button label, ends session with a plan",
+    "interview.end_session":   "button label, abandons session",
+    "chat.send":               "button label",
+    "chat.type_message":       "form input placeholder",
+    "plan.copy":               "button label",
+    "plan.copied":             "confirmation after action, keep exclamation",
+    "plan.regenerate":         "button label, produces a fresh plan",
+    "confirm.end_session":     "modal body, destructive action, warning tone",
+    "confirm.end_session_yes": "destructive confirmation button, names the action",
+    "confirm.cancel":          "button label, dismisses the modal",
+    "documents.remove":        "small inline link, verb",
+    "session.expired_title":   "page heading, status not imperative",
+    "clock.session":           "label on a status badge",
+    "clock.session_ending":    "label on a status badge, urgent tone",
+    "card.eligibility":        "field label before a value",
+    "card.application":        "field label before a value",
 }
