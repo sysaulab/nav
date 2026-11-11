@@ -1,50 +1,64 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AddressAutocomplete } from '../components/AddressAutocomplete'
+import { LanguageCloud } from '../components/LanguageCloud'
 import { Pill, type PillTone } from '../components/Pill'
+import { useT } from '../i18n/I18nContext'
 import logoUrl from '../assets/logo.svg'
 import type { GeocodeSuggestion } from '../types'
 
 export default function Welcome() {
   const navigate = useNavigate()
+  const { locale, setLocale, t } = useT()
+  const [step, setStep] = useState<'language' | 'location'>('language')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<GeocodeSuggestion | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  function handleSelect(s: GeocodeSuggestion) {
-    setSelected(s)
-    setQuery(s.display_name)
-    setError(null)
+  function pickLanguage(code: string) {
+    setLocale(code)
+    setStep('location')
   }
 
   function start() {
     if (!selected) return
-    // Store the resolved location to be picked up by the Interview page
+    // Store the resolved location to be picked up by the Interview page.
     sessionStorage.setItem('pending_location', JSON.stringify(selected))
     navigate('/interview')
+  }
+
+  if (step === 'language') {
+    return <LanguageCloud current={locale} onPick={pickLanguage} />
   }
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-slate-50 p-8">
       <div className="w-full max-w-md">
-        <header className="mb-8 text-center">
+        <button
+          onClick={() => setStep('language')}
+          className="text-sm text-slate-500 hover:text-slate-900"
+        >
+          {t('welcome.change_language')}
+        </button>
+
+        <header className="mt-4 mb-8 text-center">
           <img
             src={logoUrl}
             alt="Local Resource Navigator"
             className="mx-auto h-12 w-auto"
           />
           <h1 className="mt-4 text-3xl font-semibold text-slate-900">
-            Welcome
+            {t('welcome.title')}
           </h1>
-          <p className="mt-2 text-slate-600">
-            Talk through your situation, upload documents, and get a personalized plan.
-          </p>
+          <p className="mt-2 text-slate-600">{t('welcome.subtitle')}</p>
         </header>
 
         <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h2 className="text-lg font-medium text-slate-900">Where are you located?</h2>
+          <h2 className="text-lg font-medium text-slate-900">
+            {t('welcome.where_are_you')}
+          </h2>
           <p className="mt-2 text-sm text-slate-600">
-            We use this to find services near you. Not all addresses are in the map — if you can't find yours, pick one close by (e.g. the odd house across the street). Precise location is not required.
+            {t('welcome.location_hint')}
           </p>
 
           <div className="mt-4">
@@ -54,8 +68,12 @@ export default function Welcome() {
                 setQuery(v)
                 setSelected(null)
               }}
-              onSelect={handleSelect}
-              placeholder="e.g. M5V 2T6 or 123 Queen St W"
+              onSelect={(s) => {
+                setSelected(s)
+                setQuery(s.display_name)
+                setError(null)
+              }}
+              placeholder={t('welcome.address_placeholder')}
               autoFocus
             />
           </div>
@@ -63,7 +81,7 @@ export default function Welcome() {
           {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
 
           <div className="mt-6 rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
-            <p><strong>Note:</strong> Sessions time out after 15 minutes of inactivity during chat or upload. Everything is wiped when the session ends.</p>
+            <p>{t('welcome.privacy_note')}</p>
           </div>
 
           <button
@@ -71,7 +89,7 @@ export default function Welcome() {
             disabled={!selected}
             className="mt-6 w-full rounded-lg bg-slate-900 px-3 py-2.5 text-sm font-medium text-white disabled:opacity-50"
           >
-            Start Session
+            {t('welcome.start')}
           </button>
         </div>
 
@@ -81,6 +99,9 @@ export default function Welcome() {
   )
 }
 
+// Operational status row. Labels are kiosk-staff jargon (nav/doc/geo/
+// llm/sql), not user-facing UI — deliberately not translated. Same for
+// the health endpoints they poll.
 type HealthState = 'loading' | 'ok' | 'down'
 
 function SystemStatus() {

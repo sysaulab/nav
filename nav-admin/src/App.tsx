@@ -3,12 +3,20 @@ import { AuthProvider, useAuth } from './auth'
 import { ApiError } from './api'
 import Models from './pages/Models'
 import Prompt from './pages/Prompt'
+import Account from './pages/Account'
 import DirectoryTree from './pages/DirectoryTree'
 import Locations from './pages/Locations'
+import Languages from './pages/Languages'
 import Backup from './pages/Backup'
-import Account from './pages/Account'
 
-type Tab = 'directory' | 'locations' | 'models' | 'prompt' | 'account' | 'backup'
+type Tab =
+  | 'directory'
+  | 'locations'
+  | 'languages'
+  | 'backup'
+  | 'models'
+  | 'prompt'
+  | 'account'
 
 export default function App() {
   return (
@@ -62,6 +70,12 @@ function Shell() {
               Locations
             </NavItem>
             <NavItem
+              active={tab === 'languages'}
+              onClick={() => setTab('languages')}
+            >
+              Languages
+            </NavItem>
+            <NavItem
               active={tab === 'backup'}
               onClick={() => setTab('backup')}
             >
@@ -85,6 +99,7 @@ function Shell() {
         <section className="min-w-0 flex-1">
           {tab === 'directory' && <DirectoryTree />}
           {tab === 'locations' && <Locations />}
+          {tab === 'languages' && <Languages />}
           {tab === 'backup' && <Backup />}
           {tab === 'models' && <Models />}
           {tab === 'prompt' && <Prompt />}

@@ -13,9 +13,17 @@ from sqlalchemy import delete as sa_delete, select, text
 
 from .config import Settings
 from .db import get_engine, get_sessionmaker, init_engine
-from .models import Base, InterviewSession
+from .models import (
+    Base,
+    InterviewSession,
+    TranslationJob,
+    UiString,
+    UiStringTranslation,
+)
 from .ai.registry import reload_registry
 from .runtime import reload_runtime
+from .translator import run_translation_job
+from .ui_strings import CONTEXTS, ENGLISH_STRINGS
 from .routers import (
     admin,
     exports,
@@ -25,51 +33,31 @@ from .routers import (
     organizations,
     service_at_location,
     services,
+    ui as ui_router,
 )
 from .geocode import photon_display_name
 
 
-
-
-
 log = logging.getLogger("navigator")
+
 
 async def _purge_expired_sessions() -> int:
     now = datetime.now(timezone.utc)
 
     async with get_sessionmaker()() as db:
         # Postgres advisory lock: exactly one replica purges per tick.
-        # A replica that crashes mid-purge releases the lock on rollback.
         got = (await db.execute(
             text("SELECT pg_try_advisory_xact_lock(920111)")
         )).scalar()
         if not got:
             return 0
 
-        # Push the expiry predicate into SQL. The previous shape did a
-        # full-table SELECT and filtered `expires_at <= now` in Python,
-        # so the purge walked every session row on every tick — 30 s
-        # cadence, per replica, forever. `ix_session_expires` covers the
-        # WHERE now, so this is an index range scan whose cost is
-        # proportional to the number of expired rows (usually 0–2), not
-        # to the total session count.
-        #
-        # DELETE ... RETURNING instead of SELECT-then-DELETE:
-        #   - one round-trip instead of two
-        #   - no window (however narrow) between "which rows are expired"
-        #     and "delete those rows"
-        #   - the ids the caller logs as "purged" are precisely the ids
-        #     that were removed, not a snapshot taken moments earlier
-        # Postgres has supported DELETE ... RETURNING since 8.2;
-        # SQLAlchemy's Delete has exposed .returning() since 2.0.
         deleted_ids = (await db.execute(
             sa_delete(InterviewSession)
             .where(InterviewSession.expires_at <= now)
             .returning(InterviewSession.id)
         )).scalars().all()
 
-        # Commit unconditionally: this is what releases the advisory
-        # lock, even when there was nothing to delete.
         await db.commit()
 
     return len(deleted_ids)
@@ -84,6 +72,52 @@ async def _purge_loop(interval: float) -> None:
                 log.info("purged %d expired interview session(s)", n)
         except Exception:
             log.exception("session purge failed")
+
+
+async def _sync_ui_strings(db) -> None:
+    """Reconcile the database with the English dictionary.
+
+    The dictionary in ui_strings.py is the source of truth. Two things
+    happen on startup:
+
+      1. Keys present in the dictionary but absent from the DB are
+         inserted. This is how a new string gets its first English row.
+
+      2. Keys whose English text has changed are updated, and every
+         existing translation for that key is deleted. A translation
+         of stale English is worse than a missing translation: the
+         missing one shows an empty cell (honest); the stale one shows
+         text that no longer matches the UI (silently wrong).
+
+    Idempotent. Running on every boot is cheap (one SELECT, a few
+    UPDATEs only when the dictionary actually changed).
+    """
+    current = {
+        row.key: row
+        for row in (await db.execute(select(UiString))).scalars()
+    }
+    added = updated = 0
+    for key, english in ENGLISH_STRINGS.items():
+        if key not in current:
+            db.add(UiString(
+                key=key, english=english, context=CONTEXTS.get(key),
+            ))
+            added += 1
+        elif current[key].english != english:
+            await db.execute(
+                sa_delete(UiStringTranslation).where(
+                    UiStringTranslation.key == key,
+                )
+            )
+            current[key].english = english
+            current[key].context = CONTEXTS.get(key)
+            updated += 1
+    await db.commit()
+    if added or updated:
+        log.info(
+            "ui_strings.synced added=%d updated=%d (translations invalidated)",
+            added, updated,
+        )
 
 
 async def _http_get(url: str, timeout: float = 2.0) -> tuple[int, bytes]:
@@ -114,18 +148,31 @@ def create_app(settings: Settings) -> FastAPI:
         engine = get_engine()
         async with engine.begin() as conn:
             # Postgres: serialize schema creation across replicas.
-            # pg_advisory_xact_lock releases on commit, so a crashed
-            # replica cannot leave the lock held. The key is arbitrary
-            # but must be identical on every replica.
             await conn.execute(text("SELECT pg_advisory_xact_lock(920110)"))
             await conn.run_sync(Base.metadata.create_all)
 
-        # Populate the model registry (hardcoded -> env -> DB).
-        # Admin routes refresh this after every write, so this only
-        # runs at process start.
+        # Reconcile the English UI dictionary, then populate the runtime
+        # registries. Ordering matters: _sync_ui_strings must run before
+        # any handler that might read UiString.
         async with get_sessionmaker()() as db:
+            await _sync_ui_strings(db)
             await reload_registry(db, settings)
-            await reload_runtime(db, settings) 
+            await reload_runtime(db, settings)
+
+        # Resume any translation jobs a dying replica left pending. The
+        # admin route fired asyncio.create_task when the job was created;
+        # if that process died before completion, the job sits at
+        # status=pending (or =running with a stale heartbeat). Either way,
+        # any replica can pick it up.
+        async with get_sessionmaker()() as db:
+            pending = (await db.execute(
+                select(TranslationJob.id).where(
+                    TranslationJob.status.in_(["pending", "running"])
+                )
+            )).scalars().all()
+        for job_id in pending:
+            log.info("translations.resume job_id=%s", job_id)
+            asyncio.create_task(run_translation_job(job_id))
 
         # One-time sweep at startup so restarts don't leave orphans lying around.
         purged = await _purge_expired_sessions()
@@ -153,10 +200,6 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/api/health/geocoder")
     async def health_geocoder():
         endpoint = settings.photon_endpoint.rstrip("/")
-        # Probe the real search endpoint, not the server root — a root "/"
-        # can return 200 while the index is still warming up, giving a
-        # green pill on a broken geocoder. A tiny real query exercises
-        # the index and the JSON pipeline.
         probe_url = f"{endpoint}/api?q=a&limit=1"
         try:
             code, _ = await _http_get(probe_url, timeout=3.0)
@@ -206,17 +249,13 @@ def create_app(settings: Settings) -> FastAPI:
             "lng": lon,
             "display_name": photon_display_name(props) or q,
         }
-    
+
     @app.get("/api/geocode/search")
     async def geocode_search(
         q: str = Query(..., min_length=2, description="Address, place, or postal code"),
         limit: int = Query(5, ge=1, le=10),
     ):
-        """Fuzzy autocomplete via Photon.
-
-        Response shape matches GeocodeSuggestion in nav-ui/src/types.ts
-        exactly, so LocationGate and any other caller are unchanged.
-        """
+        """Fuzzy autocomplete via Photon."""
         endpoint = settings.photon_endpoint.rstrip("/")
         params = urllib.parse.urlencode({"q": q, "limit": limit, "lang": "en"})
         try:
@@ -258,16 +297,6 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/health/sql")
     async def health_sql():
-        """Probe the database with a trivial SELECT 1.
-
-        Reports the backend name so the SQL pill can show which engine is
-        in play. Uses the same async engine the pipeline uses, so a healthy
-        signal here means the routes will actually be able to talk to the DB.
-
-        SELECT 1 rather than the advisory-lock probe used by the purge
-        loop: advisory locks serialize against in-flight ingest, which
-        would make the health check lie under load.
-        """
         engine = get_engine()
         backend = engine.url.get_backend_name()
         try:
@@ -293,10 +322,6 @@ def create_app(settings: Settings) -> FastAPI:
     async def health_ingest():
         endpoint = settings.sanitizer_endpoint
 
-        # Probe the sanitizer's /health route, not its /ingest route.
-        # /ingest only accepts POST — a GET returns 405, which a "200..500"
-        # check would count as reachable without ever validating that the
-        # sanitizer actually answers on the endpoint we're about to POST to.
         parts = urllib.parse.urlsplit(endpoint)
         health_url = urllib.parse.urlunsplit(
             (parts.scheme, parts.netloc, "/health", "", "")
@@ -343,6 +368,7 @@ def create_app(settings: Settings) -> FastAPI:
     for r in (
         interviews.router,
         exports.router,
+        ui_router.router,
     ):
         app.include_router(r, prefix="/api")
 
@@ -359,9 +385,6 @@ def main() -> None:
     parser.add_argument("--photon-endpoint", default=None)
     args = parser.parse_args()
 
-    # Pass CLI overrides as kwargs to Settings() rather than .model_copy().
-    # database_url is a required field, so Settings() with no env var raises
-    # before a post-construction copy could supply it.
     overrides: dict = {}
     if args.db_url:
         overrides["database_url"] = args.db_url

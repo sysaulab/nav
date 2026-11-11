@@ -35,6 +35,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
+// ── Types ────────────────────────────────────────────────
+
 export type Page<T> = {
   items: T[]
   total: number
@@ -54,7 +56,7 @@ export type ModelSpec = {
   enabled: boolean
 }
 
-export type Defaults = { chat: string; finalize: string }
+export type Defaults = { chat: string; finalize: string; translate: string }
 
 export type Phone = {
   id: string
@@ -188,8 +190,44 @@ export type PromptState = {
   overridden: { chat: boolean; finalize: boolean; nearby: boolean }
 }
 
+export type TokenStatus = {
+  configured: boolean
+  source: 'env' | 'database' | 'none'
+}
+
+export type LanguageCoverage = {
+  locale: string
+  translated: number
+  total: number
+}
+
+export type UiStringRow = {
+  key: string
+  english: string
+  context: string | null
+  translated: string | null
+  translator_signature: string | null
+  translated_at: string | null
+}
+
+export type TranslationJob = {
+  id: string
+  mode: 'missing' | 'refresh'
+  locale: string | null
+  status: 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
+  total: number
+  done: number
+  failed: number
+  cancel_requested: boolean
+  error_summary: string | null
+  created_at: string
+}
+
+// ── API ──────────────────────────────────────────────────
+
 export const api = {
   health: () => request<{ ok: boolean; models: number }>('/health'),
+
   auth: {
     status: () => request<TokenStatus>('/auth/status'),
     changeToken: (
@@ -202,6 +240,7 @@ export const api = {
         body: JSON.stringify({ current_token, new_token, confirm_token }),
       }),
   },
+
   models: {
     list: () => request<ModelSpec[]>('/models'),
     get: (id: string) => request<ModelSpec>(`/models/${encodeURIComponent(id)}`),
@@ -219,10 +258,7 @@ export const api = {
         body: JSON.stringify(body),
       }),
   },
-  geocodeSearch: (q: string, signal?: AbortSignal) =>
-    request<GeocodeSuggestion[]>(`/geocode/search?q=${encodeURIComponent(q)}`, {
-      signal,
-    }),
+
   prompt: {
     state: () => request<PromptState>('/prompt'),
     setChat: (text: string) =>
@@ -243,6 +279,43 @@ export const api = {
     reset: (section: 'chat' | 'finalize' | 'nearby') =>
       request<void>(`/prompt/${section}`, { method: 'DELETE' }),
   },
+
+  geocodeSearch: (q: string, signal?: AbortSignal) =>
+    request<GeocodeSuggestion[]>(`/geocode/search?q=${encodeURIComponent(q)}`, {
+      signal,
+    }),
+
+  languages: {
+    coverage: () => request<LanguageCoverage[]>('/languages/coverage'),
+    uiStrings: (locale: string) =>
+      request<UiStringRow[]>(
+        `/ui-strings?locale=${encodeURIComponent(locale)}`,
+      ),
+    setTranslation: (key: string, locale: string, translated: string) =>
+      request<{ ok: boolean }>(
+        `/ui-strings/${encodeURIComponent(key)}/translations/${encodeURIComponent(locale)}`,
+        { method: 'PUT', body: JSON.stringify({ translated }) },
+      ),
+    deleteTranslation: (key: string, locale: string) =>
+      request<void>(
+        `/ui-strings/${encodeURIComponent(key)}/translations/${encodeURIComponent(locale)}`,
+        { method: 'DELETE' },
+      ),
+  },
+
+  translations: {
+    start: (mode: 'missing' | 'refresh', locale?: string | null) =>
+      request<TranslationJob>('/translations/run', {
+        method: 'POST',
+        body: JSON.stringify({ mode, locale: locale ?? null }),
+      }),
+    active: () => request<TranslationJob[]>('/translations/active'),
+    cancel: (jobId: string) =>
+      request<{ ok: boolean }>(`/translations/${jobId}/cancel`, {
+        method: 'POST',
+      }),
+  },
+
   directory: {
     orgs: {
       list: (page: number, pageSize = 50) =>
@@ -339,6 +412,7 @@ export const api = {
         request<void>(`/phones/${id}`, { method: 'DELETE' }),
     },
   },
+
   backup: {
     exportDatabase: async () => {
       const token = getToken()
@@ -369,9 +443,4 @@ export const api = {
       }>
     },
   },
-}
-
-export type TokenStatus = {
-  configured: boolean
-  source: 'env' | 'database' | 'none'
 }

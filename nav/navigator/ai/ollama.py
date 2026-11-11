@@ -28,6 +28,7 @@ class OllamaClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         timeout: float,
+        temperature: float | None,
     ) -> AsyncIterator[ChatEvent]:
         payload: dict[str, Any] = {
             "model": spec.model,
@@ -38,6 +39,8 @@ class OllamaClient:
                 "num_predict": spec.max_output_tokens,
             },
         }
+        if temperature is not None:
+            payload["options"]["temperature"] = temperature
         if tools:
             payload["tools"] = tools
 
@@ -90,6 +93,6 @@ class OllamaClient:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
-        timeout: float = 600.0,
+        temperature: float | None = None,
     ) -> AsyncIterator[ChatEvent]:
-        return self._stream(spec, messages, tools, timeout)
+        return self._stream(spec, messages, tools, 600.0, temperature)

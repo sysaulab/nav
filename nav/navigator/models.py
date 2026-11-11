@@ -3,7 +3,7 @@ from datetime import datetime, time, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
-    JSON, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric,
+    JSON, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric,
     String, Text, Time, UniqueConstraint, Uuid,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -455,4 +455,71 @@ class SessionDocument(Base):
             "status IN ('ready','skipped_too_large','quarantine','failed')",
             name="ck_session_document_status",
         ),
+    )
+
+class UiString(Base):
+    """The English source of truth. Populated from ui_strings.py at boot.
+
+    Editing `english` here does nothing — the dictionary is authoritative.
+    Change it in ui_strings.py, restart, and the sync will invalidate
+    every existing translation for that key (see _sync_ui_strings).
+    """
+    __tablename__ = "ui_string"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    english: Mapped[str] = mapped_column(Text, nullable=False)
+    context: Mapped[str | None] = mapped_column(String(50))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False,
+    )
+
+
+class UiStringTranslation(Base):
+    """One translation per (key, locale).
+
+    A row exists IFF a translation exists. "Untranslated" is the absence
+    of the row, not a NULL column. Delete = untranslated.
+    """
+    __tablename__ = "ui_string_translation"
+
+    key: Mapped[str] = mapped_column(
+        ForeignKey("ui_string.key", ondelete="CASCADE"), primary_key=True,
+    )
+    locale: Mapped[str] = mapped_column(String(10), primary_key=True)
+    translated: Mapped[str] = mapped_column(Text, nullable=False)
+    # "manual" if the admin typed it, else "ollama:<model>|<prompt-version>"
+    translator_signature: Mapped[str] = mapped_column(String(255), nullable=False)
+    translated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False,
+    )
+
+
+class TranslationJob(Base):
+    """Durable background job state. Claims via UPDATE...RETURNING.
+    Safe to run across multiple replicas — see claim_job() in translator.py.
+    """
+    __tablename__ = "translation_job"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)   # "missing" | "refresh"
+    locale: Mapped[str | None] = mapped_column(String(10))          # NULL = all locales
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending",
+    )   # pending | running | done | failed | cancelled
+    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+    )
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("ix_translation_job_active", "status", "created_at"),
     )

@@ -80,10 +80,12 @@ services:
       NAVIGATOR_MODELS_JSON: >-
         [
           {"id":"ollama-gemma4-cloud","module":"ollama","endpoint":"http://host.docker.internal:11434","model":"gemma4:cloud","context_window":256000,"max_output_tokens":8192,"label":"Gemma 4 (Ollama Cloud)"},
-          {"id":"ollama-local","module":"ollama","endpoint":"http://host.docker.internal:11434","model":"gemma2:2b","context_window":8192,"max_output_tokens":2048,"label":"Ollama local (gemma2:2b)"}
+          {"id":"ollama-local","module":"ollama","endpoint":"http://host.docker.internal:11434","model":"gemma2:2b","context_window":8192,"max_output_tokens":2048,"label":"Ollama local (gemma2:2b)"},
+          {"id":"index-translate-2b","module":"ollama","endpoint":"http://host.docker.internal:11434","model":"hf.co/mradermacher/Index-Translate-2B-GGUF:latest","context_window":4096,"max_output_tokens":2048,"label":"Index Translate 2B"}
         ]
       NAVIGATOR_DEFAULT_CHAT_MODEL_ID: "ollama-gemma4-cloud"
       NAVIGATOR_DEFAULT_FINALIZE_MODEL_ID: "ollama-gemma4-cloud"
+      NAVIGATOR_DEFAULT_TRANSLATE_MODEL_ID: "index-translate-2b"
 
       # Deprecated: chat and finalize route through the model registry
       # now (see nav/navigator/ai/registry.py). Kept commented for

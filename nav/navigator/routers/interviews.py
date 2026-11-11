@@ -799,6 +799,28 @@ async def _execute_get_service_details(
     return text, card
 
 
+
+def _language_directive(locale: str | None, locale_name: str | None) -> str:
+    """Tell the model which language to answer in.
+
+    English is the implicit default — no directive is emitted, so an
+    English session's prompt is byte-for-byte identical to before.
+    """
+    if not locale or locale == "en":
+        return ""
+    name = (locale_name or locale).strip()
+    if not name:
+        return ""
+    return (
+        f"\n\n## Response language\n"
+        f"The user's interface is in {name}. Respond in {name}. "
+        f"Your plan and all prose output should be in {name}. "
+        f"Proper nouns (service names, addresses) stay as-is, but "
+        f"everything you write in your own voice — questions, "
+        f"explanations, step descriptions — must be in {name}."
+    )
+
+
 # ── context assembly ─────────────────────────────────────
 
 def _render_session_context(sess: InterviewSession) -> str:
@@ -1051,6 +1073,7 @@ async def chat(
     spec = get_registry().default_chat()
 
     system_prompt, _included, _skipped, _used = await _build_chat_context(sid, db)
+    system_prompt += _language_directive(payload.locale, payload.locale_name)
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     for m in payload.messages:
@@ -1080,6 +1103,7 @@ async def finalize(
     system_prompt, _included, _skipped, _used = await _build_chat_context(
         sid, db, base=get_runtime().current().finalize_prompt
     )
+    system_prompt += _language_directive(payload.locale, payload.locale_name)
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     for m in payload.messages:

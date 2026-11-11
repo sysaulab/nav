@@ -8,9 +8,11 @@ import { api, isSessionError } from '../api'
 import { Pill, type PillTone } from '../components/Pill'
 import FileDropzone from '../components/FileDropzone'
 import { AddressAutocomplete } from '../components/AddressAutocomplete'
+import { ConfirmDialog } from '../components/ConfirmDialog'
 import { matchesAccept } from '../util/files.tsx'
 import { usePrivacy } from '../privacy/PrivacyContext'
 import { SessionClock } from '../components/SessionClock'
+import { useT } from '../i18n/I18nContext'
 import type {
   ChatItem, ChatMessage, ContextPrompt, DocumentMeta, GeocodeSuggestion,
   InterviewSession, ServiceCard, SessionLocation,
@@ -21,6 +23,7 @@ type Upload = { id: string; filename: string; pct: number }
 export default function Interview() {
   const navigate = useNavigate()
   const { unlock } = usePrivacy()
+  const { locale, localeName, t } = useT()
   const [session, setSession] = useState<InterviewSession | null>(null)
   const [docs, setDocs] = useState<DocumentMeta[]>([])
   const [context, setContext] = useState<ContextPrompt | null>(null)
@@ -39,6 +42,7 @@ export default function Interview() {
   const planHtmlRef = useRef<HTMLElement>(null)
 
   const [editingLocation, setEditingLocation] = useState(false)
+  const [confirmEndOpen, setConfirmEndOpen] = useState(false)
 
   const handleApiError = useCallback((e: unknown): boolean => {
     if (isSessionError(e)) {
@@ -142,7 +146,11 @@ export default function Interview() {
     const ext = filename.slice(i).toLowerCase()
     const replacement = BLOCKED_LEGACY[ext]
     return replacement
-      ? `${filename}: ${ext} (Office 97-2003) is not supported — re-save as ${replacement} and re-upload.`
+      ? t('documents.error_legacy_office', {
+          filename,
+          ext,
+          replacement,
+        })
       : null
   }
 
@@ -176,7 +184,7 @@ export default function Interview() {
         setError(
           hints.length > 0
             ? hints.join(' · ')
-            : 'Unsupported file type. Accepted: PDF, Office (OOXML), images, plain text.',
+            : t('documents.error_unsupported_type'),
         )
         return
       }
@@ -187,7 +195,7 @@ export default function Interview() {
         setError(
           hints.length > 0
             ? hints.join(' · ')
-            : `${rejectedFiles.length} file(s) skipped — unsupported type`,
+            : t('documents.error_skipped_count', { n: rejectedFiles.length }),
         )
       }
 
@@ -228,9 +236,18 @@ export default function Interview() {
     }
   }
 
-  async function endSession() {
+  // The click on "End session" only opens the modal. The modal's
+  // confirm button calls doEndSession, which does the actual work.
+  // Splitting the two means the modal's open/close is pure UI state,
+  // and the async side effects never run unless the user confirms.
+  function endSession() {
     if (!session) return
-    if (!confirm('End this session? Documents and chat history will be discarded.')) return
+    setConfirmEndOpen(true)
+  }
+
+  async function doEndSession() {
+    setConfirmEndOpen(false)
+    if (!session) return
     try {
       await api.interviews.end(session.id)
       unlock()
@@ -287,7 +304,7 @@ export default function Interview() {
     }
 
     try {
-      await api.interviews.chat(session.id, apiMessages, (raw) => {
+      await api.interviews.chat(session.id, apiMessages, locale, localeName, (raw) => {
         const obj = raw as {
           message?: { content?: string }
           event?: string
@@ -319,7 +336,7 @@ export default function Interview() {
     setError(null)
     let acc = ''
     try {
-      await api.interviews.finalize(session.id, priorMessages, (raw) => {
+      await api.interviews.finalize(session.id, priorMessages, locale, localeName, (raw) => {
         const obj = raw as { message?: { content?: string }; error?: string }
         if (obj.error) { setError(obj.error); return }
         if (obj.message?.content) {
@@ -427,9 +444,11 @@ export default function Interview() {
     return (
       <main className="min-h-screen bg-slate-50 p-8">
         <div className="mx-auto max-w-3xl">
-          <Link to="/" className="text-sm text-slate-500 hover:text-slate-900">← Back</Link>
+          <Link to="/" className="text-sm text-slate-500 hover:text-slate-900">
+            {t('location.back')}
+          </Link>
           <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-8 text-center">
-            <p className="text-slate-600">Starting a session…</p>
+            <p className="text-slate-600">{t('interview.starting_session')}</p>
             {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
           </div>
         </div>
@@ -479,11 +498,11 @@ export default function Interview() {
               disabled={planning}
               className="text-sm text-slate-500 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              ← Change location
+              {t('interview.change_location')}
             </button>
             <span className="text-xs text-slate-400">|</span>
             <span className="text-xs text-slate-500">
-              Location:{' '}
+              {t('interview.location_label')}{' '}
               <span className="text-slate-700">
                 {session.origin_display_name || session.postal_code}
               </span>
@@ -500,14 +519,14 @@ export default function Interview() {
                 disabled={!canFinish}
                 className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
               >
-                {planning ? 'Finishing…' : 'Finish'}
+                {planning ? t('interview.finishing') : t('interview.finish')}
               </button>
             )}
             <button
-              onClick={() => void endSession()}
+              onClick={endSession}
               className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-50"
             >
-              End session
+              {t('interview.end_session')}
             </button>
           </div>
         </div>
@@ -522,9 +541,13 @@ export default function Interview() {
           <section className="mt-6 rounded-xl border-2 border-emerald-300 bg-emerald-50 p-5">
             <div className="flex items-center justify-between gap-3">
               <div className="flex items-center gap-2">
-                <h2 className="text-lg font-medium text-emerald-900">Action plan</h2>
+                <h2 className="text-lg font-medium text-emerald-900">
+                  {t('plan.title')}
+                </h2>
                 {planning && (
-                  <span className="text-xs text-emerald-700">Generating…</span>
+                  <span className="text-xs text-emerald-700">
+                    {t('plan.generating')}
+                  </span>
                 )}
               </div>
               {!planning && plan && (
@@ -535,14 +558,14 @@ export default function Interview() {
                     className="rounded-lg border border-emerald-400 bg-white px-3 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100"
                     aria-live="polite"
                   >
-                    {copied ? 'Copied!' : 'Copy'}
+                    {copied ? t('plan.copied') : t('plan.copy')}
                   </button>
                   <button
                     type="button"
                     onClick={downloadPlan}
                     className="rounded-lg border border-emerald-400 bg-white px-3 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100"
                   >
-                    📄 Markdown
+                    {t('plan.download_markdown')}
                   </button>
                   <button
                     type="button"
@@ -550,7 +573,9 @@ export default function Interview() {
                     disabled={exportingDocx}
                     className="rounded-lg border border-emerald-400 bg-white px-3 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100 disabled:opacity-50"
                   >
-                    {exportingDocx ? '📄 Preparing…' : '📄 Office'}
+                    {exportingDocx
+                      ? t('plan.download_office_working')
+                      : t('plan.download_office')}
                   </button>
                 </div>
               )}
@@ -565,7 +590,9 @@ export default function Interview() {
               </article>
             ) : (
               !planning && (
-                <p className="mt-3 text-sm text-emerald-950">No content generated.</p>
+                <p className="mt-3 text-sm text-emerald-950">
+                  {t('plan.no_content')}
+                </p>
               )
             )}
 
@@ -576,13 +603,13 @@ export default function Interview() {
                     onClick={() => void finalize()}
                     className="text-emerald-700 underline hover:text-emerald-900"
                   >
-                    Regenerate
+                    {t('plan.regenerate')}
                   </button>
                   <button
                     onClick={() => setPlan(null)}
                     className="text-emerald-700 underline hover:text-emerald-900"
                   >
-                    Back to chat
+                    {t('plan.back_to_chat')}
                   </button>
                 </>
               )}
@@ -594,9 +621,7 @@ export default function Interview() {
           <section className="flex flex-col rounded-xl border border-slate-200 bg-white">
             <div className="flex-1 space-y-4 overflow-y-auto p-5" style={{ maxHeight: '60vh' }}>
               {chat.length === 0 && (
-                <p className="text-sm text-slate-500">
-                  Ask about the customer's situation, or upload a document on the right.
-                </p>
+                <p className="text-sm text-slate-500">{t('chat.empty_prompt')}</p>
               )}
               {chat.map((item, i) => {
                 if (item.kind === 'card') {
@@ -625,7 +650,11 @@ export default function Interview() {
                   </div>
                 )
               })}
-              {streaming && <p className="text-xs text-slate-400">Assistant is responding…</p>}
+              {streaming && (
+                <p className="text-xs text-slate-400">
+                  {t('chat.assistant_responding')}
+                </p>
+              )}
             </div>
             <form
               onSubmit={(e) => { e.preventDefault(); void send() }}
@@ -634,7 +663,7 @@ export default function Interview() {
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="Type a message…"
+                placeholder={t('chat.type_message')}
                 className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
                 disabled={streaming || planning}
               />
@@ -643,18 +672,18 @@ export default function Interview() {
                 disabled={streaming || planning || !input.trim()}
                 className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
               >
-                Send
+                {t('chat.send')}
               </button>
             </form>
           </section>
 
           <section className="space-y-4">
             <div className="rounded-xl border border-slate-200 bg-white p-5">
-              <h2 className="mb-3 text-lg font-medium">Documents</h2>
+              <h2 className="mb-3 text-lg font-medium">{t('documents.title')}</h2>
 
-                <FileDropzone onFiles={(files) => void onFiles(files)} accept={ACCEPT}>
-                  Drop files here, or click to browse.
-                </FileDropzone>
+              <FileDropzone onFiles={(files) => void onFiles(files)} accept={ACCEPT}>
+                {t('documents.dropzone')}
+              </FileDropzone>
 
               <ul className="mt-4 divide-y divide-slate-200">
                 {uploads.map((u) => {
@@ -667,14 +696,18 @@ export default function Interview() {
                         </div>
                         <div className="text-xs text-slate-500">
                           {processing
-                            ? 'Uploaded — processing…'
-                            : `Uploading · ${u.pct}%`}
+                            ? t('documents.processing')
+                            : t('documents.uploading', { pct: u.pct })}
                         </div>
                       </div>
                       <div className="ml-2 shrink-0">
                         <Pill
                           tone="busy"
-                          label={processing ? 'processing' : 'uploading'}
+                          label={
+                            processing
+                              ? t('documents.status_processing')
+                              : t('documents.status_uploading')
+                          }
                         />
                       </div>
                     </li>
@@ -687,17 +720,19 @@ export default function Interview() {
                   let label = ''
                   if (d.status === 'ready') {
                     if (included) {
-                      label = `ready · ${(d.token_estimate / 1000).toFixed(1)}K tok`
+                      label = t('documents.status_ready', {
+                        k: (d.token_estimate / 1000).toFixed(1),
+                      })
                     } else {
                       tone = 'warn'
-                      label = 'ready · skipped (budget)'
+                      label = t('documents.status_ready_skipped')
                     }
                   } else if (d.status === 'skipped_too_large') {
                     tone = 'warn'
-                    label = 'skipped — too large'
+                    label = t('documents.status_skipped_too_large')
                   } else {
                     tone = 'error'
-                    label = d.status.replace(/_/g, ' ')
+                    label = t(`documents.status_${d.status}`)
                   }
                   return (
                     <li key={d.id} className="flex items-start justify-between py-2">
@@ -716,7 +751,7 @@ export default function Interview() {
                           onClick={() => void removeDoc(d.id)}
                           className="text-[11px] text-slate-400 hover:text-red-600"
                         >
-                          remove
+                          {t('documents.remove')}
                         </button>
                       </div>
                     </li>
@@ -725,7 +760,7 @@ export default function Interview() {
 
                 {uploads.length === 0 && docs.length === 0 && (
                   <li className="py-4 text-center text-sm text-slate-500">
-                    No documents yet.
+                    {t('documents.empty')}
                   </li>
                 )}
               </ul>
@@ -742,9 +777,12 @@ export default function Interview() {
               return (
                 <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm">
                   <div className="flex items-baseline justify-between">
-                    <span className="font-medium">Context budget</span>
+                    <span className="font-medium">{t('context.title')}</span>
                     <span className="font-mono text-xs text-slate-500">
-                      {totalTokens.toLocaleString()} / {contextWindow.toLocaleString()} tokens
+                      {t('context.tokens_composed', {
+                        used: totalTokens.toLocaleString(),
+                        total: contextWindow.toLocaleString(),
+                      })}
                     </span>
                   </div>
                   {contextWindow > 0 && (
@@ -765,11 +803,22 @@ export default function Interview() {
                   )}
                   <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
                     <span>
-                      {included.length} document
-                      {included.length === 1 ? '' : 's'} included
-                      {skipped.length > 0 && ` · ${skipped.length} skipped`}
+                      {t('context.docs_included', {
+                        n: included.length,
+                        s: included.length === 1 ? '' : 's',
+                      })}
+                      {skipped.length > 0 && (
+                        <>
+                          {' · '}
+                          {t('context.docs_skipped_suffix', { n: skipped.length })}
+                        </>
+                      )}
                     </span>
-                    <span>{outputReserve.toLocaleString()} reserved for reply</span>
+                    <span>
+                      {t('context.reserved_for_reply', {
+                        n: outputReserve.toLocaleString(),
+                      })}
+                    </span>
                   </div>
                   {skipped.length > 0 && (
                     <ul className="mt-2 space-y-1 text-xs text-amber-700">
@@ -784,11 +833,22 @@ export default function Interview() {
           </section>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmEndOpen}
+        title={t('interview.end_session')}
+        body={t('confirm.end_session')}
+        confirmLabel={t('confirm.end_session_yes')}
+        cancelLabel={t('confirm.cancel')}
+        onConfirm={() => void doEndSession()}
+        onCancel={() => setConfirmEndOpen(false)}
+      />
     </main>
   )
 }
 
 function SessionExpiredModal() {
+  const { t } = useT()
   return (
     <main className="flex min-h-screen items-center justify-center bg-slate-50 p-8">
       <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-lg">
@@ -810,10 +870,11 @@ function SessionExpiredModal() {
             </svg>
           </div>
           <div className="flex-1">
-            <h2 className="text-lg font-semibold text-slate-900">Session expired</h2>
+            <h2 className="text-lg font-semibold text-slate-900">
+              {t('session.expired_title')}
+            </h2>
             <p className="mt-1 text-sm text-slate-600">
-              This session ended after 15 minutes of inactivity. Uploaded
-              documents and the chat transcript have been discarded.
+              {t('session.expired_body')}
             </p>
           </div>
         </div>
@@ -822,7 +883,7 @@ function SessionExpiredModal() {
             to="/"
             className="inline-block rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
           >
-            Return to Welcome
+            {t('session.expired_return')}
           </Link>
         </div>
       </div>
@@ -841,6 +902,7 @@ function LocationGate({
   onCancel?: () => void
   onSessionError: () => void
 }) {
+  const { t } = useT()
   const [query, setQuery] = useState(
     session.origin_display_name || session.postal_code || '',
   )
@@ -898,11 +960,11 @@ function LocationGate({
             onClick={onCancel}
             className="text-sm text-slate-500 hover:text-slate-900"
           >
-            ← Cancel
+            {t('location.cancel')}
           </button>
         ) : (
           <Link to="/" className="text-sm text-slate-500 hover:text-slate-900">
-            ← Back
+            {t('location.back')}
           </Link>
         )}
         <form
@@ -910,10 +972,10 @@ function LocationGate({
           className="mt-6 rounded-2xl border border-slate-200 bg-white p-8"
         >
           <h1 className="text-2xl font-semibold text-slate-900">
-            Where are you located?
+            {t('location.title')}
           </h1>
           <p className="mt-2 text-sm text-slate-600">
-            Start typing a postal code or address — pick a suggestion to continue.
+            {t('location.subtitle')}
           </p>
 
           <div className="mt-4">
@@ -921,7 +983,7 @@ function LocationGate({
               value={query}
               onChange={setQuery}
               onSelect={(s) => void onSelect(s)}
-              placeholder="e.g. M5V 2T6 or 123 Queen St W"
+              placeholder={t('welcome.address_placeholder')}
               disabled={busy}
               autoFocus
             />
@@ -932,7 +994,7 @@ function LocationGate({
             disabled={busy || query.trim().length < 2}
             className="mt-4 w-full rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
           >
-            {busy ? 'Looking up…' : 'Continue'}
+            {busy ? t('location.looking_up') : t('location.continue')}
           </button>
           {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
         </form>
@@ -942,12 +1004,17 @@ function LocationGate({
 }
 
 function ServiceCardView({ card }: { card: ServiceCard }) {
+  const { t } = useT()
   const s = card.service
   const [copied, setCopied] = useState(false)
   const [expanded, setExpanded] = useState(false)
 
   const distLabel =
-    s.distance_km !== null ? `${s.distance_km.toFixed(1)}km` : 'Global'
+    s.distance_km !== null
+      ? t('card.distance_km', { d: s.distance_km.toFixed(1) })
+      : t('card.global')
+
+  const categoryLabel = t(`category.${s.category}`)
 
   // Hover tooltip on the truncated location name so the full place —
   // name and address — is still discoverable without expanding.
@@ -956,16 +1023,21 @@ function ServiceCardView({ card }: { card: ServiceCard }) {
 
   async function copyCard() {
     const distStr =
-      s.distance_km !== null ? `${s.distance_km.toFixed(1)} km` : 'Global'
-    const lines: string[] = [`${s.category} — ${distStr}`, s.name]
+      s.distance_km !== null
+        ? t('card.distance_km', { d: s.distance_km.toFixed(1) })
+        : t('card.global')
+    const lines: string[] = [`${categoryLabel} — ${distStr}`, s.name]
     const placeStr = [s.location_name, s.address].filter(Boolean).join(' — ')
     if (placeStr) lines.push(placeStr)
     if (s.description) lines.push(s.description)
-    if (s.eligibility_description) lines.push(`Eligibility: ${s.eligibility_description}`)
-    if (s.application_process) lines.push(`How to apply: ${s.application_process}`)
-    if (s.fees_description) lines.push(`Fees: ${s.fees_description}`)
-    if (s.email) lines.push(`Email: ${s.email}`)
-    if (s.url) lines.push(`URL: ${s.url}`)
+    if (s.eligibility_description)
+      lines.push(`${t('card.eligibility')} ${s.eligibility_description}`)
+    if (s.application_process)
+      lines.push(`${t('card.application')} ${s.application_process}`)
+    if (s.fees_description)
+      lines.push(`${t('card.fees')} ${s.fees_description}`)
+    if (s.email) lines.push(`${t('card.email')} ${s.email}`)
+    if (s.url) lines.push(`${t('card.url')} ${s.url}`)
 
     const text = lines.join('\n')
     try {
@@ -996,13 +1068,13 @@ function ServiceCardView({ card }: { card: ServiceCard }) {
           type="button"
           onClick={() => setExpanded((e) => !e)}
           className="shrink-0 rounded px-1 font-mono text-[11px] leading-none text-slate-500 hover:bg-slate-100 hover:text-slate-900"
-          aria-label={expanded ? 'Collapse details' : 'Expand details'}
+          aria-label={expanded ? t('card.collapse') : t('card.expand')}
           aria-expanded={expanded}
         >
           {expanded ? '[-]' : '[+]'}
         </button>
         <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600">
-          {s.category}
+          {categoryLabel}
         </span>
         <span className="shrink-0 text-xs text-slate-500">{distLabel}</span>
         {s.location_name && (
@@ -1023,7 +1095,7 @@ function ServiceCardView({ card }: { card: ServiceCard }) {
           className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-slate-50"
           aria-live="polite"
         >
-          {copied ? 'Copied!' : 'Copy'}
+          {copied ? t('plan.copied') : t('plan.copy')}
         </button>
       </div>
 
@@ -1042,19 +1114,25 @@ function ServiceCardView({ card }: { card: ServiceCard }) {
           )}
           {s.eligibility_description && (
             <p className="text-xs text-slate-600">
-              <span className="font-medium text-slate-700">Eligibility:</span>{' '}
+              <span className="font-medium text-slate-700">
+                {t('card.eligibility')}
+              </span>{' '}
               {s.eligibility_description}
             </p>
           )}
           {s.application_process && (
             <p className="text-xs text-slate-600">
-              <span className="font-medium text-slate-700">How to apply:</span>{' '}
+              <span className="font-medium text-slate-700">
+                {t('card.application')}
+              </span>{' '}
               {s.application_process}
             </p>
           )}
           {s.fees_description && (
             <p className="text-xs text-slate-600">
-              <span className="font-medium text-slate-700">Fees:</span>{' '}
+              <span className="font-medium text-slate-700">
+                {t('card.fees')}
+              </span>{' '}
               {s.fees_description}
             </p>
           )}

@@ -53,9 +53,19 @@ _HARDCODED_SPECS: tuple[ModelSpec, ...] = (
         max_output_tokens=8_192,
         label="Gemma 4 (Ollama Cloud)",
     ),
+    ModelSpec(
+        id="index-translate-2b",
+        module="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="hf.co/mradermacher/Index-Translate-2B-GGUF:latest",
+        context_window=4_096,
+        max_output_tokens=2_048,
+        label="Index Translate 2B",
+    ),
 )
 _HARDCODED_DEFAULT_CHAT = "ollama-local"
 _HARDCODED_DEFAULT_FINALIZE = "ollama-local"
+_HARDCODED_DEFAULT_TRANSLATE = "index-translate-2b"
 
 
 _CLIENT_BY_MODULE: dict[str, ChatClient] = {
@@ -76,6 +86,7 @@ class ModelRegistry:
         self._specs: dict[str, ModelSpec] = {}
         self._default_chat: str = _HARDCODED_DEFAULT_CHAT
         self._default_finalize: str = _HARDCODED_DEFAULT_FINALIZE
+        self._default_translate: str = _HARDCODED_DEFAULT_TRANSLATE
 
     # ── load ─────────────────────────────────────────────
 
@@ -111,9 +122,12 @@ class ModelRegistry:
             or settings.default_finalize_model_id
             or _HARDCODED_DEFAULT_FINALIZE
         )
+        default_translate = (
+            await _get_setting(db, "default.translate")
+            or settings.default_translate_model_id
+            or _HARDCODED_DEFAULT_TRANSLATE
+        )
 
-        # Fall back when the configured default isn't in the new registry.
-        # Check `merged`, not `self._specs` — nothing has been published yet.
         if default_chat not in merged:
             log.warning(
                 "default.chat=%r not in registry; falling back to hardcoded %r",
@@ -126,17 +140,22 @@ class ModelRegistry:
                 default_finalize, _HARDCODED_DEFAULT_FINALIZE,
             )
             default_finalize = _HARDCODED_DEFAULT_FINALIZE
+        if default_translate not in merged:
+            log.warning(
+                "default.translate=%r not in registry; falling back to hardcoded %r",
+                default_translate, _HARDCODED_DEFAULT_TRANSLATE,
+            )
+            default_translate = _HARDCODED_DEFAULT_TRANSLATE
 
-        # Publish atomically — no awaits between these three lines. asyncio
-        # yields only at await points, so a reader sees all-old or all-new,
-        # never a mix.
         self._specs = merged
         self._default_chat = default_chat
         self._default_finalize = default_finalize
+        self._default_translate = default_translate
 
         log.info(
-            "registry.loaded models=%s default_chat=%s default_finalize=%s",
-            sorted(self._specs), default_chat, default_finalize,
+            "registry.loaded models=%s default_chat=%s default_finalize=%s "
+            "default_translate=%s",
+            sorted(self._specs), default_chat, default_finalize, default_translate,
         )
 
     # ── read ─────────────────────────────────────────────
@@ -161,7 +180,12 @@ class ModelRegistry:
 
     def default_finalize_id(self) -> str:
         return self._default_finalize
+    
+    def default_translate(self) -> ModelSpec:
+        return self._specs[self._default_translate]
 
+    def default_translate_id(self) -> str:
+        return self._default_translate
 
 def client_for(spec: ModelSpec) -> ChatClient:
     return _CLIENT_BY_MODULE[spec.module]

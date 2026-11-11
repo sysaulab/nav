@@ -104,14 +104,14 @@ function uploadMultipart<T>(
 // Shared NDJSON stream reader. Used by both chat and finalize.
 async function streamNdjson(
   path: string,
-  messages: import('./types').ChatMessage[],
+  payload: Record<string, unknown>,
   onChunk: (obj: unknown) => void,
 ): Promise<void> {
   notifyRequestSent()
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify(payload),
   })
   if (!res.ok) throw await parseError(res)
   const reader = res.body!.getReader()
@@ -125,25 +125,30 @@ async function streamNdjson(
     buf = lines.pop()!
     for (const line of lines) {
       if (!line.trim()) continue
-      try {
-        onChunk(JSON.parse(line))
-      } catch {
-        /* skip malformed line */
-      }
+      try { onChunk(JSON.parse(line)) } catch { /* skip */ }
     }
   }
 }
 
 export const api = {
+  ui: {
+    strings: (locale: string) =>
+      request<{ locale: string; strings: Record<string, string> }>(
+        `/ui/strings?locale=${encodeURIComponent(locale)}`,
+      ),
+  },
+
   geocode: (q: string) =>
     request<{ lat: number; lng: number; display_name: string | null } | null>(
       `/geocode?q=${encodeURIComponent(q)}`,
     ),
+
   geocodeSearch: (q: string, signal?: AbortSignal) =>
     request<import('./types').GeocodeSuggestion[]>(
       `/geocode/search?q=${encodeURIComponent(q)}`,
       { signal },
     ),
+    
   health: {
     maestro: () =>
       request<{
@@ -214,13 +219,27 @@ export const api = {
     chat: (
       sid: string,
       messages: import('./types').ChatMessage[],
+      locale: string,
+      localeName: string,
       onChunk: (obj: unknown) => void,
-    ) => streamNdjson(`/interviews/${sid}/chat`, messages, onChunk),
+    ) =>
+      streamNdjson(
+        `/interviews/${sid}/chat`,
+        { messages, locale, locale_name: localeName },
+        onChunk,
+      ),
 
     finalize: (
       sid: string,
       messages: import('./types').ChatMessage[],
+      locale: string,
+      localeName: string,
       onChunk: (obj: unknown) => void,
-    ) => streamNdjson(`/interviews/${sid}/finalize`, messages, onChunk),
+    ) =>
+      streamNdjson(
+        `/interviews/${sid}/finalize`,
+        { messages, locale, locale_name: localeName },
+        onChunk,
+      ),
   },
 }

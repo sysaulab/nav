@@ -11,7 +11,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status, File, Form, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import delete as sa_delete, func, select, text, update
+from sqlalchemy import (
+    and_, delete as sa_delete, func, select, text, update,
+)
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai.base import ModelSpec
@@ -20,6 +23,7 @@ from ..config import Settings
 from ..db import get_db
 from ..models import (
     AppSetting, Location, Organization, Phone, Service, ServiceAtLocation,
+    TranslationJob, UiString, UiStringTranslation,
 )
 from ..schemas import (
     LocationIn, LocationOut, LocationServiceIn, OrganizationIn, OrganizationOut,
@@ -144,12 +148,14 @@ async def get_defaults() -> dict[str, str]:
     return {
         "chat": reg.default_chat_id(),
         "finalize": reg.default_finalize_id(),
+        "translate": reg.default_translate_id(),
     }
 
 
 class DefaultsIn(BaseModel):
     chat: str | None = None
     finalize: str | None = None
+    translate: str | None = None
 
 
 @router.put("/models/defaults", dependencies=[Depends(require_admin)])
@@ -166,11 +172,16 @@ async def set_defaults(
         if reg.get(payload.finalize) is None:
             raise HTTPException(400, f"unknown model id: {payload.finalize!r}")
         await set_app_setting(db, "default.finalize", payload.finalize)
+    if payload.translate is not None:
+        if reg.get(payload.translate) is None:
+            raise HTTPException(400, f"unknown model id: {payload.translate!r}")
+        await set_app_setting(db, "default.translate", payload.translate)
 
     reg = await reload_registry(db, _cfg())
     return {
         "chat": reg.default_chat_id(),
         "finalize": reg.default_finalize_id(),
+        "translate": reg.default_translate_id(),
     }
 
 
@@ -1001,3 +1012,416 @@ async def admin_import_database(
         await db.rollback()
         raise HTTPException(500, f"import failed: {e}")
     return {"ok": True, "mode": mode, "counts": counts}
+
+# ── UI strings & translations ───────────────────────────
+
+class UiStringRow(BaseModel):
+    key: str
+    english: str
+    context: str | None
+    translated: str | None          # NULL = not translated for this locale
+    translator_signature: str | None
+    translated_at: datetime | None
+
+
+@router.get("/ui-strings", dependencies=[Depends(require_admin)])
+async def list_ui_strings(
+    locale: str = Query(..., min_length=2, max_length=10),
+    db: AsyncSession = Depends(get_db),
+) -> list[UiStringRow]:
+    stmt = (
+        select(UiString, UiStringTranslation)
+        .outerjoin(
+            UiStringTranslation,
+            and_(
+                UiStringTranslation.key == UiString.key,
+                UiStringTranslation.locale == locale,
+            ),
+        )
+        .order_by(UiString.key)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        UiStringRow(
+            key=s.key, english=s.english, context=s.context,
+            translated=t.translated if t else None,
+            translator_signature=t.translator_signature if t else None,
+            translated_at=t.translated_at if t else None,
+        )
+        for s, t in rows
+    ]
+
+
+@router.put(
+    "/ui-strings/{key}/translations/{locale}",
+    dependencies=[Depends(require_admin)],
+)
+async def set_translation(
+    key: str, locale: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    translated = str(payload.get("translated", "")).strip()
+    if not translated:
+        raise HTTPException(400, "translated must be non-empty")
+    if await db.get(UiString, key) is None:
+        raise HTTPException(404, f"unknown key: {key}")
+
+    stmt = pg_insert(UiStringTranslation).values(
+        key=key, locale=locale, translated=translated,
+        translator_signature="manual",
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["key", "locale"],
+        set_={"translated": translated,
+              "translator_signature": "manual",
+              "translated_at": func.now()},
+    )
+    await db.execute(stmt)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete(
+    "/ui-strings/{key}/translations/{locale}",
+    status_code=204,
+    dependencies=[Depends(require_admin)],
+)
+async def delete_translation(
+    key: str, locale: str, db: AsyncSession = Depends(get_db),
+) -> None:
+    await db.execute(
+        sa_delete(UiStringTranslation).where(
+            UiStringTranslation.key == key,
+            UiStringTranslation.locale == locale,
+        )
+    )
+    await db.commit()
+
+
+class CoverageRow(BaseModel):
+    locale: str
+    translated: int
+    total: int
+
+
+@router.get("/languages/coverage", dependencies=[Depends(require_admin)])
+async def coverage(db: AsyncSession = Depends(get_db)) -> list[CoverageRow]:
+    total = (await db.execute(
+        select(func.count()).select_from(UiString)
+    )).scalar() or 0
+
+    rows = (await db.execute(
+        select(UiStringTranslation.locale, func.count())
+        .group_by(UiStringTranslation.locale)
+    )).all()
+    counts = {loc: n for loc, n in rows}
+
+    from ..translator import CHINESE_NAMES
+    return sorted(
+        [
+            CoverageRow(
+                locale=loc,
+                translated=counts.get(loc, 0),
+                total=total,
+            )
+            for loc in CHINESE_NAMES
+            if loc != "en"      # English is the source; it has no row
+        ],
+        key=lambda r: r.locale,
+    )
+
+
+# ── Translation jobs ─────────────────────────────────────
+
+class StartJobIn(BaseModel):
+    mode: str = Field(pattern="^(missing|refresh)$")
+    locale: str | None = None      # NULL = all locales
+
+
+class JobOut(BaseModel):
+    id: str
+    mode: str
+    locale: str | None
+    status: str
+    total: int
+    done: int
+    failed: int
+    cancel_requested: bool
+    error_summary: str | None
+    created_at: datetime
+
+
+def _job_out(j: TranslationJob) -> JobOut:
+    return JobOut(
+        id=str(j.id), mode=j.mode, locale=j.locale, status=j.status,
+        total=j.total, done=j.done, failed=j.failed,
+        cancel_requested=j.cancel_requested,
+        error_summary=j.error_summary, created_at=j.created_at,
+    )
+
+
+@router.post("/translations/run", dependencies=[Depends(require_admin)])
+async def start_translation_job(
+    payload: StartJobIn, db: AsyncSession = Depends(get_db),
+) -> JobOut:
+    from ..translator import run_translation_job
+
+    active = (await db.execute(
+        select(func.count()).select_from(TranslationJob).where(
+            TranslationJob.status.in_(["pending", "running"])
+        )
+    )).scalar() or 0
+    if active:
+        raise HTTPException(409, "a translation job is already running")
+
+    if payload.mode == "refresh":
+        if not payload.locale:
+            raise HTTPException(400, "refresh requires a locale")
+        # Delete first so the "missing" collector sees the work.
+        await db.execute(
+            sa_delete(UiStringTranslation).where(
+                UiStringTranslation.locale == payload.locale
+            )
+        )
+
+    job = TranslationJob(mode=payload.mode, locale=payload.locale)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    # Convenience: start on this replica. If this process dies, the
+    # startup sweep in main.py will resume it on the next boot.
+    import asyncio
+    asyncio.create_task(run_translation_job(job.id))
+
+    return _job_out(job)
+
+
+@router.get("/translations/active", dependencies=[Depends(require_admin)])
+async def active_jobs(db: AsyncSession = Depends(get_db)) -> list[JobOut]:
+    rows = (await db.execute(
+        select(TranslationJob)
+        .where(TranslationJob.status.in_(["pending", "running"]))
+        .order_by(TranslationJob.created_at.desc())
+    )).scalars().all()
+    return [_job_out(j) for j in rows]
+
+
+@router.post(
+    "/translations/{job_id}/cancel",
+    dependencies=[Depends(require_admin)],
+)
+async def cancel_job(job_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    await db.execute(
+        update(TranslationJob)
+        .where(
+            TranslationJob.id == job_id,
+            TranslationJob.status.in_(["pending", "running"]),
+        )
+        .values(cancel_requested=True)
+    )
+    await db.commit()
+    return {"ok": True}# ── UI strings & translations ───────────────────────────
+
+class UiStringRow(BaseModel):
+    key: str
+    english: str
+    context: str | None
+    translated: str | None          # NULL = not translated for this locale
+    translator_signature: str | None
+    translated_at: datetime | None
+
+
+@router.get("/ui-strings", dependencies=[Depends(require_admin)])
+async def list_ui_strings(
+    locale: str = Query(..., min_length=2, max_length=10),
+    db: AsyncSession = Depends(get_db),
+) -> list[UiStringRow]:
+    stmt = (
+        select(UiString, UiStringTranslation)
+        .outerjoin(
+            UiStringTranslation,
+            and_(
+                UiStringTranslation.key == UiString.key,
+                UiStringTranslation.locale == locale,
+            ),
+        )
+        .order_by(UiString.key)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        UiStringRow(
+            key=s.key, english=s.english, context=s.context,
+            translated=t.translated if t else None,
+            translator_signature=t.translator_signature if t else None,
+            translated_at=t.translated_at if t else None,
+        )
+        for s, t in rows
+    ]
+
+
+@router.put(
+    "/ui-strings/{key}/translations/{locale}",
+    dependencies=[Depends(require_admin)],
+)
+async def set_translation(
+    key: str, locale: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    translated = str(payload.get("translated", "")).strip()
+    if not translated:
+        raise HTTPException(400, "translated must be non-empty")
+    if await db.get(UiString, key) is None:
+        raise HTTPException(404, f"unknown key: {key}")
+
+    stmt = pg_insert(UiStringTranslation).values(
+        key=key, locale=locale, translated=translated,
+        translator_signature="manual",
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["key", "locale"],
+        set_={"translated": translated,
+              "translator_signature": "manual",
+              "translated_at": func.now()},
+    )
+    await db.execute(stmt)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete(
+    "/ui-strings/{key}/translations/{locale}",
+    status_code=204,
+    dependencies=[Depends(require_admin)],
+)
+async def delete_translation(
+    key: str, locale: str, db: AsyncSession = Depends(get_db),
+) -> None:
+    await db.execute(
+        sa_delete(UiStringTranslation).where(
+            UiStringTranslation.key == key,
+            UiStringTranslation.locale == locale,
+        )
+    )
+    await db.commit()
+
+
+class CoverageRow(BaseModel):
+    locale: str
+    translated: int
+    total: int
+
+
+@router.get("/languages/coverage", dependencies=[Depends(require_admin)])
+async def coverage(db: AsyncSession = Depends(get_db)) -> list[CoverageRow]:
+    total = (await db.execute(
+        select(func.count()).select_from(UiString)
+    )).scalar() or 0
+
+    rows = (await db.execute(
+        select(UiStringTranslation.locale, func.count())
+        .group_by(UiStringTranslation.locale)
+    )).all()
+    counts = {loc: n for loc, n in rows}
+
+    from ..translator import LANGUAGE_NAMES
+    return sorted(
+        [CoverageRow(locale=loc, translated=counts.get(loc, 0), total=total)
+         for loc in LANGUAGE_NAMES],
+        key=lambda r: r.locale,
+    )
+
+
+# ── Translation jobs ─────────────────────────────────────
+
+class StartJobIn(BaseModel):
+    mode: str = Field(pattern="^(missing|refresh)$")
+    locale: str | None = None      # NULL = all locales
+
+
+class JobOut(BaseModel):
+    id: str
+    mode: str
+    locale: str | None
+    status: str
+    total: int
+    done: int
+    failed: int
+    cancel_requested: bool
+    error_summary: str | None
+    created_at: datetime
+
+
+def _job_out(j: TranslationJob) -> JobOut:
+    return JobOut(
+        id=str(j.id), mode=j.mode, locale=j.locale, status=j.status,
+        total=j.total, done=j.done, failed=j.failed,
+        cancel_requested=j.cancel_requested,
+        error_summary=j.error_summary, created_at=j.created_at,
+    )
+
+
+@router.post("/translations/run", dependencies=[Depends(require_admin)])
+async def start_translation_job(
+    payload: StartJobIn, db: AsyncSession = Depends(get_db),
+) -> JobOut:
+    from ..translator import run_translation_job
+
+    active = (await db.execute(
+        select(func.count()).select_from(TranslationJob).where(
+            TranslationJob.status.in_(["pending", "running"])
+        )
+    )).scalar() or 0
+    if active:
+        raise HTTPException(409, "a translation job is already running")
+
+    if payload.mode == "refresh":
+        if not payload.locale:
+            raise HTTPException(400, "refresh requires a locale")
+        # Delete first so the "missing" collector sees the work.
+        await db.execute(
+            sa_delete(UiStringTranslation).where(
+                UiStringTranslation.locale == payload.locale
+            )
+        )
+
+    job = TranslationJob(mode=payload.mode, locale=payload.locale)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    # Convenience: start on this replica. If this process dies, the
+    # startup sweep in main.py will resume it on the next boot.
+    import asyncio
+    asyncio.create_task(run_translation_job(job.id))
+
+    return _job_out(job)
+
+
+@router.get("/translations/active", dependencies=[Depends(require_admin)])
+async def active_jobs(db: AsyncSession = Depends(get_db)) -> list[JobOut]:
+    rows = (await db.execute(
+        select(TranslationJob)
+        .where(TranslationJob.status.in_(["pending", "running"]))
+        .order_by(TranslationJob.created_at.desc())
+    )).scalars().all()
+    return [_job_out(j) for j in rows]
+
+
+@router.post(
+    "/translations/{job_id}/cancel",
+    dependencies=[Depends(require_admin)],
+)
+async def cancel_job(job_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    await db.execute(
+        update(TranslationJob)
+        .where(
+            TranslationJob.id == job_id,
+            TranslationJob.status.in_(["pending", "running"]),
+        )
+        .values(cancel_requested=True)
+    )
+    await db.commit()
+    return {"ok": True}

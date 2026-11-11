@@ -90,7 +90,13 @@ class ChatClient(Protocol):
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
     ) -> AsyncIterator[ChatEvent]:
         """Yield ChatEvent. Implementations must not raise on network
-        failure; yield ChatEvent(kind="error", ...) and stop."""
+        failure; yield ChatEvent(kind="error", ...) and stop.
+
+        `temperature` — when None, the backend uses its default (0.8 for
+        Ollama). Translate passes 0.0 for deterministic decoding; chat
+        and finalize leave it None.
+        """
         ...

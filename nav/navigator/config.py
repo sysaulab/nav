@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     ollama_endpoint: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma4:e4b"
     ollama_timeout_s: float = 600.0
-
+    default_translate_model_id: str | None = None
+    
     final_model: str = "gemma4:e4b"
     final_timeout_s: float = 600.0
 

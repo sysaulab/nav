@@ -161,3 +161,9 @@ class ChatMessageIn(_In):
 
 class ChatRequestIn(_In):
     messages: list[ChatMessageIn]
+    # UI locale of this session. Used to inject a "respond in X" directive
+    # into the system prompt. `locale_name` is the English name of the
+    # language, sent by the client from its bundled language list. Both
+    # are optional: an English kiosk sends neither.
+    locale: str | None = Field(default=None, max_length=10)
+    locale_name: str | None = Field(default=None, max_length=64)

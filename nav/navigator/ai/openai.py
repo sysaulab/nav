@@ -33,6 +33,7 @@ class OpenAIClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         timeout: float,
+        temperature: float | None,
     ) -> AsyncIterator[ChatEvent]:
         api_key = self._api_key(spec)
         if not api_key:
@@ -49,6 +50,8 @@ class OpenAIClient:
             "max_tokens": spec.max_output_tokens,
             "stream": True,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -132,13 +135,13 @@ class OpenAIClient:
                 kind="error",
                 error=f"connection failed to {spec.endpoint}: {e}",
             )
-    
+
     def stream_chat(
         self,
         spec: ModelSpec,
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
-        timeout: float = 600.0,
+        temperature: float | None = None,
     ) -> AsyncIterator[ChatEvent]:
-        return self._stream(spec, messages, tools, timeout)
+        return self._stream(spec, messages, tools, 600.0, temperature)
