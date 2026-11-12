@@ -19,3 +19,7 @@ tokenizer = ["transformers>=4.40"]
 
 [tool.setuptools.packages.find]
 include = ["navigator*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

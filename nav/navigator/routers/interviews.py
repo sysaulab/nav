@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from ..geocode import photon_display_name
@@ -291,6 +292,7 @@ from ..ai.base import ChatEvent, ModelSpec
 from ..ai.registry import client_for, get_registry
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
+log = logging.getLogger("navigator.interviews")
 
 _settings: Settings | None = None
 
@@ -1210,18 +1212,23 @@ def _stream_with_tools(
             assistant_text = ""
             errored = False
 
-            async for ev in client.stream_chat(spec, messages, tools=tools):
-                if ev.kind == "delta" and ev.text:
-                    assistant_text += ev.text
-                    yield _wire_delta(ev.text)
-                elif ev.kind == "tool":
-                    tool_events.append(ev)
-                elif ev.kind == "done":
-                    break
-                elif ev.kind == "error":
-                    yield _wire_error(ev.error or "unknown model error")
-                    errored = True
-                    break
+            try:
+                async for ev in client.stream_chat(spec, messages, tools=tools):
+                    if ev.kind == "delta" and ev.text:
+                        assistant_text += ev.text
+                        yield _wire_delta(ev.text)
+                    elif ev.kind == "tool":
+                        tool_events.append(ev)
+                    elif ev.kind == "done":
+                        break
+                    elif ev.kind == "error":
+                        yield _wire_error(ev.error or "unknown model error")
+                        errored = True
+                        break
+            except Exception as e:
+                log.exception("chat.stream.tool_round.uncaught round=%d", _round)
+                yield _wire_error(f"model backend raised: {e}")
+                return
 
             if errored:
                 return
@@ -1268,14 +1275,18 @@ def _stream_simple(
 ) -> StreamingResponse:
     async def stream():
         client = client_for(spec)
-        async for ev in client.stream_chat(spec, messages):
-            if ev.kind == "delta" and ev.text:
-                yield _wire_delta(ev.text)
-            elif ev.kind == "error":
-                yield _wire_error(ev.error or "unknown model error")
-                return
-            elif ev.kind == "done":
-                return
+        try:
+            async for ev in client.stream_chat(spec, messages):
+                if ev.kind == "delta" and ev.text:
+                    yield _wire_delta(ev.text)
+                elif ev.kind == "error":
+                    yield _wire_error(ev.error or "unknown model error")
+                    return
+                elif ev.kind == "done":
+                    return
+        except Exception as e:
+            log.exception("chat.stream.uncaught")
+            yield _wire_error(f"model backend raised: {e}")
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
