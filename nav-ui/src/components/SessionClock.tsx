@@ -26,7 +26,16 @@ export function SessionClock({
 
   useEffect(() => { onExpiredRef.current = onExpired }, [onExpired])
 
-  useEffect(() => onRequest((t0) => { setLastAt(t0); firedRef.current = false }), [])
+  // onRequest returns a cleanup callback — return it from the effect
+  // so a remount (navigating away and back to /interview) unsubscribes
+  // the previous listener instead of appending a new one that fires
+  // setLastAt on an unmounted component.
+  useEffect(() => {
+    return onRequest((t0) => {
+      setLastAt(t0)
+      firedRef.current = false
+    })
+  }, [])
 
   useEffect(() => {
     if (!seedExpiresAt) return

@@ -59,9 +59,10 @@ export default function Backup() {
     }
 
     const confirmed = window.confirm(
-      `Replace all directory data with the contents of "${file.name}"?` +
+      `Replace all directory data, operator settings, and UI translations ` +
+      `with the contents of "${file.name}"?` +
       summary +
-      '\n\nThis cannot be undone. Session state is preserved.',
+      '\n\nThis cannot be undone. Active sessions are preserved.',
     )
     if (!confirmed) return
 
@@ -89,7 +90,9 @@ export default function Backup() {
       <div className="mb-6">
         <h2 className="text-lg font-medium text-slate-900">Backup & Restore</h2>
         <p className="mt-0.5 text-xs text-slate-500">
-          Download the directory as a JSON file, or restore from a previous backup.
+          Download a snapshot of the directory, operator settings, and UI
+          translations, or restore from a previous backup. Active sessions
+          are not included.
         </p>
       </div>
 
@@ -97,7 +100,8 @@ export default function Backup() {
         <section className="rounded-xl border border-slate-200 bg-white p-5">
           <h3 className="text-sm font-medium text-slate-900">Export</h3>
           <p className="mt-1 text-xs text-slate-500">
-            Download a complete snapshot of organizations, locations, and services.
+            Download a complete snapshot of organizations, locations,
+            services, operator settings, and UI translations.
           </p>
           {exportError && (
             <div className="mt-3 rounded bg-red-50 p-2 text-xs text-red-800">
@@ -116,7 +120,9 @@ export default function Backup() {
         <section className="rounded-xl border border-red-200 bg-red-50 p-5">
           <h3 className="text-sm font-medium text-red-900">Restore</h3>
           <p className="mt-1 text-xs text-red-700">
-            Replace the entire directory with a previous backup. This is destructive and cannot be undone.
+            Replace the entire directory, operator settings, and UI
+            translations with a previous backup. This is destructive and
+            cannot be undone.
           </p>
           
           <input

@@ -1,12 +1,31 @@
-"""JSON export and import for the directory tables.
+"""JSON export and import for the directory tables and operator state.
 
 Sessions and session documents are excluded by design: they are
-ephemeral, per-visitor, and not part of what the directory is.
-The export is the directory; the sessions are the running system.
+ephemeral, per-visitor, and not part of what the operator needs to back
+up. Translation jobs and their per-row progress are also excluded —
+the operator re-runs the job if a restore leaves a locale incomplete.
+
+What is included (FORMAT_VERSION 2.0):
+  - directory: organization, taxonomy, location, service, contact,
+    service_at_location, phone, schedule, required_document,
+    service_taxonomy, live_occupancy
+  - operator state: app_setting (model registry overrides, prompt
+    overrides, nearby params, admin token)
+  - UI dictionary: ui_string (English source) and ui_string_translation
+    (every locale, including hand-edited rows with signature="manual")
+
+The English source (ui_string) is rebuilt from code on every boot by
+_sync_ui_strings, so exporting it is partly belt-and-suspenders — but a
+restore that skipped it would leave ui_string_translation rows pointing
+at absent FK targets. It is cleared and restored atomically with its
+translations.
 
 Format invariants:
-  - format_version pins the shape. An import of a payload with any
-    other version is rejected without touching the database.
+  - format_version pins the shape. This module writes 2.0 and accepts
+    1.0 (directory-only, pre-v2.0 backups) on import. Any other version
+    is rejected before touching the database.
+  - A 1.0 payload clears and restores only the directory tables;
+    app_setting and the translation tables are left untouched.
   - Each table is a flat list of row objects. Every column of the
     corresponding model must appear in every row; an unknown column
     is an error, not silently dropped.
@@ -25,6 +44,7 @@ from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
+    AppSetting,
     Base,
     Contact,
     LiveOccupancy,
@@ -37,15 +57,18 @@ from .models import (
     ServiceAtLocation,
     ServiceTaxonomy,
     Taxonomy,
+    UiString,
+    UiStringTranslation,
 )
 
 
-FORMAT_VERSION = "1.0"
+FORMAT_VERSION = "2.0"
+_SUPPORTED_VERSIONS: frozenset[str] = frozenset({"1.0", "2.0"})
 
-# FK-safe insert order. Every parent appears above its children.
+# v1.0 tables, in FK-safe insert order. Every parent above its children.
 # The two self-referencing tables (organization, taxonomy) are patched
 # in a second pass after every row exists.
-_EXPORT_ORDER: tuple[str, ...] = (
+_DIRECTORY_ORDER: tuple[str, ...] = (
     "organization",
     "taxonomy",
     "location",
@@ -58,6 +81,23 @@ _EXPORT_ORDER: tuple[str, ...] = (
     "service_taxonomy",
     "live_occupancy",
 )
+
+# v2.0 adds operator state. app_setting and ui_string have no FK
+# dependents; ui_string_translation depends on ui_string. Insert order
+# matches that dependency, so _clear_tables' reverse-of-insert ordering
+# deletes children before parents.
+_EXPORT_ORDER: tuple[str, ...] = _DIRECTORY_ORDER + (
+    "app_setting",
+    "ui_string",
+    "ui_string_translation",
+)
+
+# Per-version required table set. A 1.0 payload legitimately omits the
+# operator-state tables; a 2.0 payload that omits them is malformed.
+_REQUIRED_BY_VERSION: dict[str, tuple[str, ...]] = {
+    "1.0": _DIRECTORY_ORDER,
+    "2.0": _EXPORT_ORDER,
+}
 
 # table -> (parent_column, primary_key_column). Both parent columns
 # are nullable, so we can insert with NULL and UPDATE afterwards.
@@ -78,6 +118,9 @@ _MODEL_BY_TABLE: dict[str, type[Base]] = {
     "required_document": RequiredDocument,
     "service_taxonomy": ServiceTaxonomy,
     "live_occupancy": LiveOccupancy,
+    "app_setting": AppSetting,
+    "ui_string": UiString,
+    "ui_string_translation": UiStringTranslation,
 }
 
 
@@ -122,7 +165,12 @@ def _decode(column_type: Any, value: Any) -> Any:
 
 
 async def export_directory(db: AsyncSession) -> dict[str, Any]:
-    """Return a JSON-serializable snapshot of the directory tables."""
+    """Return a JSON-serializable snapshot of every persistent table.
+
+    The name is retained for backwards compatibility with the admin
+    route; the export now covers operator state (app_setting) and
+    translations in addition to the directory.
+    """
     out: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -143,45 +191,60 @@ async def export_directory(db: AsyncSession) -> dict[str, Any]:
 
 
 def validate_payload(payload: Any) -> list[str]:
-    """Return a list of validation errors. Empty list means OK."""
+    """Return a list of validation errors. Empty list means OK.
+
+    Accepts both 2.0 (this module's output) and 1.0 (pre-operator-state
+    backups). A 1.0 payload is imported directory-only; app_setting and
+    the translation tables are left untouched.
+    """
     errors: list[str] = []
     if not isinstance(payload, dict):
         return ["payload is not a JSON object"]
 
     version = payload.get("format_version")
-    if version != FORMAT_VERSION:
+    if version not in _SUPPORTED_VERSIONS:
         errors.append(
             f"unsupported format_version: {version!r} "
-            f"(expected {FORMAT_VERSION!r})"
+            f"(supported: {sorted(_SUPPORTED_VERSIONS)})"
         )
+        return errors
 
     tables = payload.get("tables")
     if not isinstance(tables, dict):
         errors.append("payload.tables is not an object")
         return errors
 
-    for name in _EXPORT_ORDER:
+    required = _REQUIRED_BY_VERSION[version]
+    allowed = set(required)
+
+    for name in required:
         if name not in tables:
             errors.append(f"missing table: {name}")
         elif not isinstance(tables[name], list):
             errors.append(f"table {name!r} is not a list")
 
     for name in tables:
-        if name not in _EXPORT_ORDER:
-            errors.append(f"unknown table: {name}")
+        if name not in allowed:
+            errors.append(
+                f"unknown table for format {version}: {name}"
+            )
     return errors
 
 
-async def _clear_directory(db: AsyncSession) -> None:
-    """Delete every directory row in reverse FK order.
+async def _clear_tables(db: AsyncSession, table_names: set[str]) -> None:
+    """Delete rows from the named tables, in reverse FK order.
 
-    DELETE (not TRUNCATE ... CASCADE) so we never touch session
-    tables. Sessions keep running against a directory that is
-    momentarily empty; the closure note in get_service_details
-    handles any dangling indices from ongoing conversations.
+    Takes the set explicitly so a v1.0 import clears only the directory
+    tables it is about to restore, leaving operator state intact.
+
+    DELETE (not TRUNCATE ... CASCADE) so we never touch session tables.
+    Sessions keep running against a directory that is momentarily
+    empty; the closure note in get_service_details handles any dangling
+    indices from ongoing conversations.
     """
     for name in reversed(_EXPORT_ORDER):
-        await db.execute(sa_delete(_MODEL_BY_TABLE[name]))
+        if name in table_names:
+            await db.execute(sa_delete(_MODEL_BY_TABLE[name]))
 
 
 async def _insert_table(
@@ -226,14 +289,16 @@ async def _insert_table(
 async def import_directory(
     db: AsyncSession, payload: dict[str, Any], *, mode: str = "replace",
 ) -> dict[str, int]:
-    """Load a directory snapshot. Returns per-table inserted counts.
+    """Load a backup snapshot. Returns per-table inserted counts.
 
     Wrapped in the caller's transaction — this function does NOT
     commit. A failure leaves the database unchanged.
 
-    `mode` is currently only "replace": clear every directory table,
-    then insert the snapshot. A future "merge" mode would upsert by
-    id without clearing.
+    `mode` is currently only "replace": clear every table present in
+    the payload, then insert the snapshot. A v1.0 payload clears and
+    restores only the directory tables; app_setting and translations
+    are left untouched. A v2.0 payload clears and restores everything.
+    A future "merge" mode would upsert by id without clearing.
     """
     if mode != "replace":
         raise ValueError(f"unsupported import mode: {mode!r}")
@@ -242,10 +307,13 @@ async def import_directory(
     if errors:
         raise ValueError("; ".join(errors))
 
-    await _clear_directory(db)
+    tables_to_clear = set(payload["tables"].keys())
+    await _clear_tables(db, tables_to_clear)
 
     counts: dict[str, int] = {}
     for table_name in _EXPORT_ORDER:
+        if table_name not in payload["tables"]:
+            continue
         rows = payload["tables"][table_name]
         await _insert_table(db, table_name, rows)
         counts[table_name] = len(rows)

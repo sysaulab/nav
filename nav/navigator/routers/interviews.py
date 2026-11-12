@@ -4,15 +4,42 @@ import json
 import logging
 import math
 import re
-from ..geocode import photon_display_name
+import time as _time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
-import time as _time
-from dataclasses import dataclass
 
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
+from fastapi import (
+    APIRouter, Depends, File, HTTPException, Request, Response,
+    UploadFile, status,
+)
+from fastapi.responses import StreamingResponse
+from sqlalchemy import and_, delete as sa_delete, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..ai.base import ChatEvent, ModelSpec
+from ..ai.registry import client_for, get_registry
+from ..config import Settings
+from ..db import get_db
+from ..geocode import photon_display_name
+from ..models import (
+    InterviewSession, Location, Service, ServiceAtLocation, SessionDocument,
+)
+from ..prompt import assemble_prompt, render_document
+from ..runtime import get_runtime
+from ..sanitize import filter_sanitizer_output
+from ..schemas import (
+    ChatRequestIn,
+    ContextPromptOut,
+    DocumentMetaOut,
+    InterviewSessionOut,
+    PostalCodeIn,
+    SessionLocationOut,
+    SkippedDocumentOut,
+)
+from ..tokens import estimate_tokens, estimate_chat_tokens
 
 SESSION_COOKIE = "nav_session"
 SESSION_COOKIE_MAX_AGE = 60 * 60 * 24 * 365  # 1 year
@@ -256,30 +283,6 @@ def _set_session_cookie(response: Response, sid: UUID) -> None:
         path="/",
     )
 
-from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, delete as sa_delete, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from ..config import Settings
-from ..db import get_db
-from ..models import (
-    InterviewSession, Location, Service, ServiceAtLocation, SessionDocument,
-)
-from ..prompt import assemble_prompt, render_document
-from ..runtime import get_runtime
-from ..sanitize import filter_sanitizer_output
-from ..schemas import (
-    ChatRequestIn,
-    ContextPromptOut,
-    DocumentMetaOut,
-    InterviewSessionOut,
-    PostalCodeIn,
-    SessionLocationOut,
-    SkippedDocumentOut,
-)
-from ..tokens import estimate_tokens, estimate_chat_tokens
-from ..ai.base import ChatEvent, ModelSpec
-from ..ai.registry import client_for, get_registry
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
 log = logging.getLogger("navigator.interviews")
@@ -1187,6 +1190,38 @@ def _wire_error(message: str) -> bytes:
     return (json.dumps({"error": message}) + "\n").encode()
 
 
+def _tool_call_payload(
+    t: ChatEvent, index: int, round_: int, module: str,
+) -> dict:
+    """Build one entry for the assistant message's `tool_calls` array.
+
+    The wire shape differs between backends:
+
+      OpenAI  -> {id, type: "function", function: {name, arguments: JSON string}}
+      Ollama  -> {id?, type?, function: {name, arguments: dict}}
+                 (older versions omit id/type; newer accept both)
+
+    OpenAI's spec requires `arguments` to be a JSON *string*, while
+    Ollama emits and accepts a dict. Sending a dict to OpenAI (or a
+    JSON string to a strict Ollama) fails schema validation on the
+    very next round, so the serialization must be module-aware.
+
+    `id` is synthesized when the backend did not emit one so the
+    assistant turn and the matching tool message share a stable
+    handle regardless of backend age.
+    """
+    call_id = t.tool_call_id or f"call_{round_}_{index}"
+    raw_args = t.tool_arguments or {}
+    serialized = json.dumps(raw_args) if module == "openai" else raw_args
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": t.tool_name,
+            "arguments": serialized,
+        },
+    }
+
 def _stream_with_tools(
     spec: ModelSpec,
     messages: list[dict],
@@ -1225,22 +1260,26 @@ def _stream_with_tools(
             if not tool_events:
                 return
 
+            # Replay the assistant turn with proper per-backend tool_call
+            # shape. `arguments` is a JSON string for OpenAI, a dict for
+            # Ollama. `id` is synthesized when the backend did not emit
+            # one; `type: "function"` is required by OpenAI and tolerated
+            # by Ollama. See _tool_call_payload for the full rationale.
             messages.append({
                 "role": "assistant",
                 "content": assistant_text,
                 "tool_calls": [
-                    {
-                        "function": {
-                            "name": t.tool_name,
-                            "arguments": t.tool_arguments or {},
-                        },
-                    }
-                    for t in tool_events
+                    _tool_call_payload(t, i, _round, spec.module)
+                    for i, t in enumerate(tool_events)
                 ],
             })
 
             emitted_cards: set[int] = set()
-            for t in tool_events:
+            for i, t in enumerate(tool_events):
+                # Same ID the assistant turn just used, so the tool
+                # message pairs correctly under either backend's
+                # matching rules.
+                call_id = t.tool_call_id or f"call_{_round}_{i}"
                 if t.tool_name == "get_service_details":
                     text, card = await _execute_get_service_details(
                         (t.tool_arguments or {}).get("index"), sess, db,
@@ -1248,10 +1287,15 @@ def _stream_with_tools(
                     if card is not None and card["index"] not in emitted_cards:
                         emitted_cards.add(card["index"])
                         yield _wire_card(card)
-                    messages.append({"role": "tool", "content": text})
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": text,
+                    })
                 else:
                     messages.append({
                         "role": "tool",
+                        "tool_call_id": call_id,
                         "content": f"unknown tool: {t.tool_name}",
                     })
 
