@@ -44,48 +44,54 @@ class OllamaClient:
         if tools:
             payload["tools"] = tools
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream(
-                "POST", f"{spec.endpoint.rstrip('/')}/api/chat", json=payload,
-            ) as r:
-                if r.status_code >= 400:
-                    body = await r.aread()
-                    yield ChatEvent(
-                        kind="error",
-                        error=f"ollama {r.status_code}: {body[:300]!r}",
-                    )
-                    return
-
-                pending_tool_calls: list[dict] = []
-                async for line in r.aiter_lines():
-                    if not line.strip():
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    msg = chunk.get("message") or {}
-                    if msg.get("content"):
-                        yield ChatEvent(kind="delta", text=msg["content"])
-                    if msg.get("tool_calls"):
-                        pending_tool_calls.extend(msg["tool_calls"])
-                    if chunk.get("done"):
-                        for tc in pending_tool_calls:
-                            fn = tc.get("function") or {}
-                            yield ChatEvent(
-                                kind="tool",
-                                tool_call_id=tc.get("id"),
-                                tool_name=fn.get("name", ""),
-                                tool_arguments=fn.get("arguments") or {},
-                            )
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST", f"{spec.endpoint.rstrip('/')}/api/chat", json=payload,
+                ) as r:
+                    if r.status_code >= 400:
+                        body = await r.aread()
                         yield ChatEvent(
-                            kind="done",
-                            finish_reason=chunk.get("done_reason"),
+                            kind="error",
+                            error=f"ollama {r.status_code}: {body[:300]!r}",
                         )
                         return
 
-                yield ChatEvent(kind="error", error="ollama stream ended early")
+                    pending_tool_calls: list[dict] = []
+                    async for line in r.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        msg = chunk.get("message") or {}
+                        if msg.get("content"):
+                            yield ChatEvent(kind="delta", text=msg["content"])
+                        if msg.get("tool_calls"):
+                            pending_tool_calls.extend(msg["tool_calls"])
+                        if chunk.get("done"):
+                            for tc in pending_tool_calls:
+                                fn = tc.get("function") or {}
+                                yield ChatEvent(
+                                    kind="tool",
+                                    tool_call_id=tc.get("id"),
+                                    tool_name=fn.get("name", ""),
+                                    tool_arguments=fn.get("arguments") or {},
+                                )
+                            yield ChatEvent(
+                                kind="done",
+                                finish_reason=chunk.get("done_reason"),
+                            )
+                            return
+
+                    yield ChatEvent(kind="error", error="ollama stream ended early")
+        except httpx.RequestError as e:
+            yield ChatEvent(
+                kind="error",
+                error=f"connection failed to {spec.endpoint}: {e}",
+            )
 
     def stream_chat(
         self,

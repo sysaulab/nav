@@ -112,17 +112,24 @@ ENGLISH_STRINGS: dict[str, str] = {
     "confirm.cancel": "Cancel",
 
     # ── Categories (from interviews._category_of) ────────
-    "category.SHELTER": "SHELTER",
+    "category.BANKING": "BANKING",
+    "category.BATHROOM": "BATHROOM",
+    "category.COFFEE": "COFFEE",
+    "category.CHILD": "CHILD",
+    "category.COUNSEL": "COUNSEL",
+    "category.EDUCATION": "EDUCATION",
+    "category.EMPLOYMENT": "EMPLOYMENT",
+    "category.FINANCE": "FINANCE",
     "category.FOOD": "FOOD",
     "category.HEALTH": "HEALTH",
     "category.LEGAL": "LEGAL",
-    "category.EMPLOYMENT": "EMPLOYMENT",
-    "category.EDUCATION": "EDUCATION",
-    "category.COUNSEL": "COUNSEL",
-    "category.FINANCE": "FINANCE",
-    "category.CHILD": "CHILD",
-    "category.TRANSPORT": "TRANSPORT",
+    "category.MEAL": "MEAL",
     "category.OTHER": "OTHER",
+    "category.PAPERWORK": "PAPERWORK",
+    "category.PHARMACY": "PHARMACY",
+    "category.PRIMARY": "PRIMARY CARE",
+    "category.SHELTER": "SHELTER",
+    "category.TRANSPORT": "TRANSPORT",
 }
 
 
