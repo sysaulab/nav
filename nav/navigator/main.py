@@ -10,6 +10,7 @@ import logging
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import delete as sa_delete, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .config import Settings
 from .db import get_engine, get_sessionmaker, init_engine
@@ -77,89 +78,60 @@ async def _purge_loop(interval: float) -> None:
 async def _sync_ui_strings(db) -> None:
     """Reconcile the database with the English dictionary.
 
-    The dictionary in ui_strings.py is the source of truth. Three
-    things happen on startup:
+    The dictionary in ui_strings.py is the source of truth. Two things
+    happen on startup:
 
-      1. Keys present in the dictionary but absent from ui_string are
+      1. Keys present in the dictionary but absent from the DB are
          inserted. This is how a new string gets its first English row.
 
-      2. Keys whose English text has changed are updated. If the en
-         row is source-managed (or missing), the new text is propagated
-         and every existing non-English translation for that key is
-         deleted — a translation of stale English is worse than a
-         missing one. If the en row is operator-overridden
-         (signature='manual'), the file text is recorded but the
-         override and its translations are left alone: the non-English
-         rows were translating the override, not the file.
+      2. Keys whose English text has changed are updated, and every
+         existing translation for that key is deleted. A translation
+         of stale English is worse than a missing translation: the
+         missing one shows an empty cell (honest); the stale one shows
+         text that no longer matches the UI (silently wrong).
 
-      3. en rows are backfilled for any key that lacks one. This is
-         what makes English a served-from-DB locale on a fresh install
-         and on any database predating en-in-db.
+    Concurrency-safe across replicas booting simultaneously against a
+    shared Postgres. The `added` branch uses INSERT ... ON CONFLICT
+    DO NOTHING: N replicas racing to seed the same key all execute the
+    same statement, exactly one wins the primary key, the rest are
+    no-ops, and no replica aborts on IntegrityError. The `updated`
+    branch was already safe — every replica computes the same new
+    English from the same source dictionary and writes it, so the
+    final value is identical regardless of interleaving.
 
-    Idempotent. Running on every boot is cheap.
+    Idempotent. Running on every boot is cheap (one SELECT, a few
+    writes only when the dictionary actually changed).
     """
     current = {
         row.key: row
         for row in (await db.execute(select(UiString))).scalars()
     }
-    en_by_key = {
-        r.key: r for r in (await db.execute(
-            select(UiStringTranslation).where(
-                UiStringTranslation.locale == "en"
-            )
-        )).scalars()
-    }
-
     added = updated = 0
     for key, english in ENGLISH_STRINGS.items():
         if key not in current:
-            db.add(UiString(
-                key=key, english=english, context=CONTEXTS.get(key),
-            ))
-            added += 1
+            inserted = (await db.execute(
+                pg_insert(UiString)
+                .values(key=key, english=english, context=CONTEXTS.get(key))
+                .on_conflict_do_nothing(index_elements=["key"])
+                .returning(UiString.key)
+            )).scalar()
+            if inserted:
+                added += 1
         elif current[key].english != english:
+            await db.execute(
+                sa_delete(UiStringTranslation).where(
+                    UiStringTranslation.key == key,
+                )
+            )
             current[key].english = english
             current[key].context = CONTEXTS.get(key)
-
-            en_row = en_by_key.get(key)
-            if en_row is None or en_row.translator_signature == "source":
-                # Source-managed English: propagate the file change and
-                # invalidate every non-English translation — they were
-                # translating the *previous* effective English, which
-                # just changed. If the en row is missing entirely,
-                # create it now with the new text.
-                if en_row is None:
-                    db.add(UiStringTranslation(
-                        key=key, locale="en", translated=english,
-                        translator_signature="source",
-                    ))
-                else:
-                    en_row.translated = english
-                    en_row.translated_at = datetime.now(timezone.utc)
-                await db.execute(
-                    sa_delete(UiStringTranslation).where(
-                        UiStringTranslation.key == key,
-                        UiStringTranslation.locale != "en",
-                    )
-                )
-            # else: translator_signature == "manual" — operator override
-            # is the effective English. Non-English rows were derived
-            # from *that*, not from the file. Leave everything alone.
             updated += 1
-
     await db.commit()
-
-    # Backfill: covers fresh installs and legacy databases predating
-    # en-in-db. Idempotent; does not touch manual overrides.
-    seeded = await seed_missing_english(db)
-
-    if added or updated or seeded:
+    if added or updated:
         log.info(
-            "ui_strings.synced added=%d updated=%d en_seeded=%d "
-            "(translations invalidated where applicable)",
-            added, updated, seeded,
+            "ui_strings.synced added=%d updated=%d (translations invalidated)",
+            added, updated,
         )
-
 
 async def _http_get(url: str, timeout: float = 2.0) -> tuple[int, bytes]:
     """GET via urllib, off the event loop. Never raises on HTTPError — returns the code."""
