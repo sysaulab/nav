@@ -36,7 +36,7 @@ log = logging.getLogger("navigator.translator")
 # the storage key — admin can click "Refresh {language}" to regenerate.
 TRANSLATOR_PROMPT_VERSION = "index-v1"
 
-MAX_CONCURRENT = 6
+MAX_CONCURRENT = 1
 HEARTBEAT_STALE_SECONDS = 90
 
 
@@ -46,15 +46,16 @@ HEARTBEAT_STALE_SECONDS = 90
 # Codes are ISO 639-1 where available, FLORES-200 3-letter codes for
 # the rest (mww, hif, ceb, haw, etc.).
 #
+# INVARIANT: every code here is a distinct language the translate
+# job may target. Do not register two codes for the same language
+# (e.g. `rm` + `roh` both = Romansh) — `_collect_work` iterates this
+# dict's keys for a locale=None job, so a duplicate would translate
+# every string twice and write rows the frontend never reads. If a
+# language has multiple valid codes, pick one canonical code and
+# expose the others as aliases at the client edge, not here.
+#
 # Chinese names drive the prompt template:
 #   请将以下英语文本翻译为{中文语言名}，直接输出翻译结果，不要进行任何解释。
-#
-# Codes are the app's canonical identifiers. Dialects that share a
-# parent (Egyptian/Moroccan/Levantine Arabic) map to `ar` and are
-# distinguishable only via the prompt text if needed later.
-#
-# `en` is present so the language picker can list it; it is never a
-# translation target — see seed_missing_english().
 
 CHINESE_NAMES: dict[str, str] = {
     # ── Core 22 (Table 32) ───────────────────────────────
@@ -86,8 +87,7 @@ CHINESE_NAMES: dict[str, str] = {
     "fo": "法罗语",    "gd": "苏格兰盖尔语", "co": "科西嘉语",
     "oc": "奥克语",    "se": "北萨米语",     "rm": "罗曼什语",
     "gsw": "瑞士德语", "nds": "低地德语",    "ast": "阿斯图里亚语",
-    "roh": "罗曼什语", "nrm": "诺曼语",      "hsb": "上索布语",
-    "vec": "威尼斯语",
+    "nrm": "诺曼语",   "hsb": "上索布语",    "vec": "威尼斯语",
     # South Asian
     "bn": "孟加拉语",  "ur": "乌尔都语",     "mr": "马拉地语",
     "ta": "泰米尔语",  "ne": "尼泊尔语",     "ml": "马拉雅拉姆语",
@@ -108,7 +108,7 @@ CHINESE_NAMES: dict[str, str] = {
     "ig": "伊博语",    "zu": "祖鲁语",       "xh": "科萨语",
     "st": "塞索托语",  "sn": "绍纳语",       "rw": "卢旺达语",
     "rn": "基隆迪语",  "ny": "齐切瓦语",     "mg": "马达加斯加语",
-    "om": "奥罗莫语",  "mg": "马达加斯加语",
+    "om": "奥罗莫语",
     # East & Southeast Asian
     "yue": "粤语",     "ceb": "宿务语",      "jv": "爪哇语",
     "su": "巽他语",    "hil": "希利盖农语",  "mww": "白苗语",
