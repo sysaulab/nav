@@ -8,7 +8,6 @@ import {
 } from 'react'
 import { api } from '../api'
 import { LANGUAGES } from '../languages'
-import { ENGLISH_STRINGS } from './english'
 
 // Locales whose script direction is RTL. The set is small and stable;
 // adding a locale means adding its ISO code here (and it must also
@@ -56,6 +55,12 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
   const [locale, setLocaleState] = useState<string>(initialLocale)
   const [translations, setTranslations] = useState<Record<string, string>>({})
   const [loaded, setLoaded] = useState(false)
+  // Gate the very first render. Before the first fetch resolves,
+  // `translations` is empty and `t()` would emit raw keys
+  // ("welcome.title") for a frame. Return an inert shell instead.
+  // Subsequent locale switches do NOT re-trigger this gate — the
+  // previous locale's strings stay visible until the new ones land.
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false)
 
   // Persist on change. Kiosk restart preserves the last-used language;
   // the Welcome language picker is still shown at the start of every
@@ -65,27 +70,38 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     try { localStorage.setItem(STORAGE_KEY, l) } catch { /* ignore */ }
   }, [])
 
-  // Fetch translations whenever the locale changes. English short-
-  // circuits: the bundle is the dictionary.
+  // Fetch translations whenever the locale changes. Every locale —
+  // including English — is served by the backend from
+  // ui_string_translation. There is no client-side dictionary and no
+  // English short-circuit: a language is a language. English is
+  // seeded from ui_strings.py on the server (translator signature
+  // "source") and can be overridden via the admin UI (signature
+  // "manual"), and the client sees whichever one the server serves.
   useEffect(() => {
     let alive = true
-    setTranslations({})
-    if (locale === 'en') {
-      setLoaded(true)
-      return () => { alive = false }
-    }
+    // Deliberately do NOT clear `translations` here. On a locale switch
+    // this keeps the previous language's text visible for the ~100 ms
+    // the fetch takes, instead of flashing raw keys. `loaded` still
+    // flips to false so any consumer that wants a "translating…" cue
+    // can show one.
     setLoaded(false)
     api.ui.strings(locale)
       .then((r) => {
         if (!alive) return
         setTranslations(r.strings)
         setLoaded(true)
+        setHasLoadedOnce(true)
       })
       .catch(() => {
         if (!alive) return
-        // Fall through to English fallback via t() — log quietly.
+        // Fail-open: drop to raw keys. On the very first load this is
+        // the initial {} state anyway; on a switch failure this is
+        // explicit — better than showing the previous locale's text
+        // under a new language code. The kiosk is talking to its own
+        // backend; if this fails, sessions/chat fail too.
         setTranslations({})
         setLoaded(true)
+        setHasLoadedOnce(true)
       })
     return () => { alive = false }
   }, [locale])
@@ -99,10 +115,11 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
 
   const t = useCallback(
     (key: string, vars?: Record<string, string | number>): string => {
-      const template =
-        translations[key] ??
-        ENGLISH_STRINGS[key] ??
-        key
+      // Missing key falls through to the raw key. There is no bundled
+      // fallback dictionary — English comes from the server like every
+      // other locale. A visible "welcome.title" on screen means the
+      // backend is unreachable, which is the honest signal.
+      const template = translations[key] ?? key
       return format(template, vars)
     },
     [translations],
@@ -120,6 +137,10 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     }),
     [locale, setLocale, t, loaded],
   )
+
+  if (!hasLoadedOnce) {
+    return <div className="min-h-screen bg-slate-50" />
+  }
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>
 }

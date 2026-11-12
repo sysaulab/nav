@@ -18,7 +18,7 @@ ENGLISH_STRINGS: dict[str, str] = {
     "welcome.title": "Welcome",
     "welcome.subtitle": "Talk through your situation, upload documents, and get a personalized plan.",
     "welcome.where_are_you": "Where are you located?",
-    "welcome.location_hint": "We use this to find services near you. Not all addresses are in the map — if you can't find yours, pick one close by (e.g. the odd house across the street). Precise location is not required.",
+    "welcome.location_hint": "We use this to find services near you. Not all addresses are in the map — if you can't find yours, pick one close by (e.g. the house across the street). Precise location is not required.",
     "welcome.address_placeholder": "e.g. M5V 2T6 or 123 Queen St W",
     "welcome.start": "Start Session",
     "welcome.privacy_note": "Sessions time out after 15 minutes of inactivity during chat or upload. Everything is wiped when the session ends.",
@@ -38,7 +38,7 @@ ENGLISH_STRINGS: dict[str, str] = {
     "interview.change_location": "← Change location",
     "interview.location_label": "Location:",
     "interview.end_session": "End session",
-    "interview.finish": "Finish",
+    "interview.finish": "Produce plan",
     "interview.finishing": "Finishing…",
 
     # ── Chat ─────────────────────────────────────────────

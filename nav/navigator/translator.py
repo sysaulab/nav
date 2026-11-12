@@ -7,6 +7,14 @@ produce noticeably worse output.
 
 temperature=0.0 is non-negotiable: the model card recommends greedy
 decoding, and translation quality degrades sharply with sampling.
+
+English is a locale like every other one. "Translating" it means copying
+``ui_string.english`` verbatim (see ``seed_missing_english``); no LLM
+call, no network. The client carries no bundled dictionary — it fetches
+English over HTTP from ``ui_string_translation`` just like French or
+Spanish. The server fills the en rows on startup, and the translate job
+seeds them first so every other locale translates the *effective*
+English (including operator overrides) rather than the file text.
 """
 from __future__ import annotations
 
@@ -44,6 +52,9 @@ HEARTBEAT_STALE_SECONDS = 90
 # Codes are the app's canonical identifiers. Dialects that share a
 # parent (Egyptian/Moroccan/Levantine Arabic) map to `ar` and are
 # distinguishable only via the prompt text if needed later.
+#
+# `en` is present so the language picker can list it; it is never a
+# translation target — see seed_missing_english().
 
 CHINESE_NAMES: dict[str, str] = {
     # ── Core 22 (Table 32) ───────────────────────────────
@@ -159,7 +170,67 @@ async def _llm_translate(text: str, locale: str) -> str:
     return cleaned
 
 
-# ── Job lifecycle (unchanged from the durable design) ────
+# ── English seeding ──────────────────────────────────────
+#
+# English is served from ui_string_translation like every other locale,
+# but it is *not* translated. This function copies ui_string.english
+# verbatim into a (key, 'en') row with signature 'source'. Two callers:
+#
+#   - main._sync_ui_strings, on every boot. Ensures fresh installs and
+#     legacy databases (predating en-in-db) start with a complete en
+#     dictionary without waiting for an admin to click "translate".
+#
+#   - run_translation_job, at the start of a run that covers en. Ensures
+#     a "refresh all" job fills en first, so the non-en targets translate
+#     the *effective* English (override-aware) rather than the file text.
+#
+# Existing rows — source or manual — are never touched here. Updating a
+# source-signed en row when ui_string.english changes is
+# _sync_ui_strings' job, not this one's.
+
+async def seed_missing_english(db: AsyncSession) -> int:
+    """Populate ui_string_translation(locale='en') from ui_string.english.
+
+    Idempotent. Existing rows (whether signature='source' or 'manual')
+    are left alone — operator overrides must survive both startup sync
+    and translate-missing runs.
+
+    Commits internally. Returns the number of rows added.
+    """
+    existing = set(
+        (
+            await db.execute(
+                select(UiStringTranslation.key).where(
+                    UiStringTranslation.locale == "en"
+                )
+            )
+        ).scalars().all()
+    )
+
+    rows = (
+        await db.execute(select(UiString.key, UiString.english))
+    ).all()
+
+    added = 0
+    for key, english in rows:
+        if key in existing:
+            continue
+        db.add(
+            UiStringTranslation(
+                key=key,
+                locale="en",
+                translated=english,
+                translator_signature="source",
+            )
+        )
+        added += 1
+
+    if added:
+        await db.commit()
+    return added
+
+
+# ── Job lifecycle ────────────────────────────────────────
 
 async def claim_job(db: AsyncSession, job_id: uuid.UUID) -> bool:
     stmt = (
@@ -190,26 +261,53 @@ async def _collect_work(
     db: AsyncSession, locale: str | None,
 ) -> list[tuple[str, str, str]]:
     targets = [locale] if locale else list(CHINESE_NAMES.keys())
+    # English is seeded by seed_missing_english, not collected here.
+    # If it slipped through it would double up with the seed.
+    targets = [t for t in targets if t != "en"]
+    if not targets:
+        return []
+
     keys = (
         await db.execute(select(UiString.key, UiString.english))
     ).all()
-    existing: set[tuple[str, str]] = set(
-        (await db.execute(
-            select(UiStringTranslation.key, UiStringTranslation.locale)
-        )).all()
+
+    # Effective English: the en row when it exists (which may be an
+    # operator override, signature='manual'), else the file value.
+    # Non-English translations must translate what the customer will
+    # actually read in the en interface, not what is on disk.
+    en_map: dict[str, str] = dict(
+        (
+            await db.execute(
+                select(
+                    UiStringTranslation.key,
+                    UiStringTranslation.translated,
+                ).where(UiStringTranslation.locale == "en")
+            )
+        ).all()
     )
+
+    existing: set[tuple[str, str]] = set(
+        (
+            await db.execute(
+                select(
+                    UiStringTranslation.key,
+                    UiStringTranslation.locale,
+                ).where(UiStringTranslation.locale.in_(targets))
+            )
+        ).all()
+    )
+
     work: list[tuple[str, str, str]] = []
     for k in keys:
+        source = en_map.get(k.key) or k.english
         for loc in targets:
-            if loc == "en":
-                continue
             if (k.key, loc) not in existing:
-                work.append((k.key, loc, k.english))
+                work.append((k.key, loc, source))
     return work
 
 
 async def run_translation_job(job_id: uuid.UUID) -> None:
-    # ── Phase 1: claim and collect work (one short-lived session) ──
+    # ── Phase 1: claim, seed English, collect work ──
     async with get_sessionmaker()() as db:
         if not await claim_job(db, job_id):
             return
@@ -217,8 +315,18 @@ async def run_translation_job(job_id: uuid.UUID) -> None:
 
         job = await db.get(TranslationJob, job_id)
         assert job is not None
+
+        # English first. Non-English work reads the en table below, so
+        # seeding must precede _collect_work — otherwise French would
+        # translate the file text while the en UI shows the override.
+        seeded = 0
+        if job.locale in (None, "en"):
+            seeded = await seed_missing_english(db)
+
         work = await _collect_work(db, job.locale)
-        job.total = len(work)
+        job.total = seeded + len(work)
+        # Copies are synchronous — count them as done immediately.
+        job.done = seeded
         await db.commit()
 
     if not work:

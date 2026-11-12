@@ -7,6 +7,8 @@ from ..geocode import photon_display_name
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
+import time as _time
+from dataclasses import dataclass
 
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
@@ -41,6 +43,208 @@ TOOL_SCHEMA = {
 }
 
 
+# ── per-session nearby cache ─────────────────────────────
+#
+# Built once per (session, location). Holds:
+#   - the pre-rendered "## Customer location / ## Global
+#     services / ## Nearby services / tool hint" block —
+#     identical across turns until the location changes
+#   - a list of entries with pre-computed distances
+#   - a dict of already-revealed services, keyed by index,
+#     each carrying its rendered detail and UI card payload
+#
+# A reveal adds to `revealed` without touching `short_block`.
+# Location change wipes and rebuilds the whole entry.
+# Session end wipes it.
+#
+# Process-local. Sessions are ephemeral and single-replica;
+# a restart rebuilds on the next turn from
+# `sess.nearby_service_ids` + `sess.revealed_service_indices`,
+# both of which live in the DB.
+
+@dataclass
+class _NearbyEntry:
+    index: int
+    service_id: str
+    name: str
+    location_id: str
+    location_name: str | None
+    location_address: str | None
+    distance_km: float | None
+    missing: bool = False
+
+
+@dataclass
+class _RevealedDetail:
+    rendered: str
+    card: dict
+
+
+@dataclass
+class _SessionNearbyCache:
+    location_hash: str
+    entries: list[_NearbyEntry]
+    short_block: str
+    revealed: dict[int, _RevealedDetail]
+
+
+_session_nearby_cache: dict[UUID, _SessionNearbyCache] = {}
+_SESSION_NEARBY_CACHE_MAX = 500
+
+
+def _location_hash(sess: InterviewSession) -> str:
+    return (
+        f"{sess.postal_code or ''}|"
+        f"{sess.origin_lat}|{sess.origin_lng}|"
+        f"{sess.origin_display_name or ''}"
+    )
+
+
+def _build_cache_from_items(
+    sess: InterviewSession,
+    items: list[tuple[int, "Service | None", "Location | None", float | None]],
+) -> _SessionNearbyCache:
+    entries: list[_NearbyEntry] = []
+    for idx, svc, loc, d in items:
+        if svc is None or loc is None:
+            entries.append(_NearbyEntry(
+                index=idx, service_id="", name="",
+                location_id="", location_name=None,
+                location_address=None, distance_km=None,
+                missing=True,
+            ))
+        else:
+            entries.append(_NearbyEntry(
+                index=idx,
+                service_id=str(svc.id),
+                name=svc.name,
+                location_id=str(loc.id),
+                location_name=loc.name,
+                location_address=loc.address,
+                distance_km=d,
+            ))
+    short_block = _render_nearby_short(
+        entries,
+        sess.postal_code or "unknown",
+        sess.origin_display_name,
+    )
+    return _SessionNearbyCache(
+        location_hash=_location_hash(sess),
+        entries=entries,
+        short_block=short_block,
+        revealed={},
+    )
+
+
+async def _rebuild_nearby_cache(
+    sess: InterviewSession, db: AsyncSession,
+) -> _SessionNearbyCache:
+    items = await _fetch_nearby_by_ids(
+        db, sess.nearby_service_ids or [], sess,
+    )
+    if not items:
+        n = get_runtime().current().nearby
+        rows = await _nearby_services(
+            db, sess.origin_lat, sess.origin_lng,
+            n.radius_km, n.location_limit, n.index_limit,
+        )
+        sess.nearby_service_ids = [str(svc.id) for svc, _l, _d in rows]
+        await db.commit()
+        items = [(i, svc, loc, d) for i, (svc, loc, d) in enumerate(rows)]
+
+    cache = _build_cache_from_items(sess, items)
+
+    # Restore reveals that the DB remembers but the cache lost
+    # (process restart, cache eviction). Re-fetch each service
+    # once; these are individually small and rare.
+    for idx in (sess.revealed_service_indices or []):
+        if idx < 0 or idx >= len(cache.entries):
+            continue
+        entry = cache.entries[idx]
+        if entry.missing or not entry.service_id:
+            continue
+        svc = await db.get(Service, UUID(entry.service_id))
+        if svc is None:
+            continue
+        loc = (
+            await db.get(Location, UUID(entry.location_id))
+            if entry.location_id else None
+        )
+        cache.revealed[idx] = _RevealedDetail(
+            rendered=_render_service_full(idx, svc, loc, entry.distance_km),
+            card=_card_payload(idx, svc, loc, entry.distance_km),
+        )
+    return cache
+
+
+async def _ensure_nearby_cache(
+    sess: InterviewSession, db: AsyncSession,
+) -> _SessionNearbyCache:
+    current_hash = _location_hash(sess)
+    cache = _session_nearby_cache.get(sess.id)
+    if cache is not None and cache.location_hash == current_hash:
+        return cache
+
+    if len(_session_nearby_cache) >= _SESSION_NEARBY_CACHE_MAX:
+        for k in list(_session_nearby_cache.keys())[:50]:
+            _session_nearby_cache.pop(k, None)
+
+    cache = await _rebuild_nearby_cache(sess, db)
+    _session_nearby_cache[sess.id] = cache
+    return cache
+
+
+
+# ── per-session render cache ─────────────────────────────
+#
+# The "Nearby services" block appended to the system prompt is
+# identical across every chat turn until either the location
+# changes or a new service is revealed via get_service_details.
+# Recomputing it every call costs ~10ms of DB+Python work that
+# produces byte-identical output.
+#
+# Keyed on session id. Value: (location_hash, revealed_count,
+# rendered_block, monotonic_timestamp). A hit requires all three
+# of: matching location, unchanged reveal count, age < TTL. TTL
+# bounds staleness for the "admin edited a service mid-session"
+# case, which is rare on a kiosk but not impossible.
+#
+# Process-local is fine: sessions are ephemeral, the deployment
+# is single-replica, and a restart simply re-derives the block
+# on the next turn. A DB-backed cache would add a schema change
+# for zero practical benefit here.
+
+_render_cache: dict[UUID, tuple[str, int, str, float]] = {}
+_RENDER_CACHE_TTL_S = 120.0
+_RENDER_CACHE_MAX = 200
+
+
+def _location_hash(sess: InterviewSession) -> str:
+    return (
+        f"{sess.postal_code or ''}|"
+        f"{sess.origin_lat}|{sess.origin_lng}|"
+        f"{sess.origin_display_name or ''}"
+    )
+
+
+def _invalidate_render_cache(sid: UUID) -> None:
+    _render_cache.pop(sid, None)
+
+
+def _prune_render_cache() -> None:
+    if not _render_cache:
+        return
+    now = _time.monotonic()
+    for k in [k for k, v in _render_cache.items() if now - v[3] > _RENDER_CACHE_TTL_S]:
+        _render_cache.pop(k, None)
+    if len(_render_cache) > _RENDER_CACHE_MAX:
+        excess = len(_render_cache) - _RENDER_CACHE_MAX
+        for k, _ in sorted(_render_cache.items(), key=lambda kv: kv[1][3])[:excess]:
+            _render_cache.pop(k, None)
+
+
+
+
 def _read_session_cookie(request: Request) -> UUID | None:
     raw = request.cookies.get(SESSION_COOKIE)
     if not raw:
@@ -62,7 +266,7 @@ def _set_session_cookie(response: Response, sid: UUID) -> None:
     )
 
 from fastapi.responses import StreamingResponse
-from sqlalchemy import delete as sa_delete, select
+from sqlalchemy import and_, delete as sa_delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
@@ -192,6 +396,7 @@ async def end_session(
         raise HTTPException(404, "session not found")
     await db.execute(sa_delete(InterviewSession).where(InterviewSession.id == sid))
     await db.commit()
+    _session_nearby_cache.pop(sid, None)
 
 
 # ── location ─────────────────────────────────────────────
@@ -274,12 +479,17 @@ async def set_location(
     await db.commit()
     await db.refresh(sess)
 
+    # Warm the cache so the first chat turn is a hit.
+    items = [(i, svc, loc, d) for i, (svc, loc, d) in enumerate(rows)]
+    _session_nearby_cache[sid] = _build_cache_from_items(sess, items)
+
     return SessionLocationOut(
         postal_code=sess.postal_code,
         origin_lat=sess.origin_lat,
         origin_lng=sess.origin_lng,
         origin_display_name=sess.origin_display_name,
     )
+
 
 
 # ── documents ────────────────────────────────────────────
@@ -468,16 +678,43 @@ async def _nearby_services(
     cos_lat = max(math.cos(math.radians(lat0)), 0.01)
     deg_pad_lng = radius_km * _DEG_PER_KM / cos_lat
 
-    # No coordinate predicate in SQL — NULL-coord rows are global services
-    # (crisis lines, province-wide info lines) that apply to every
-    # customer. They rank first in the result. Coordinates are only used
-    # for the *local* bucket; the haversine filter below drops locals
-    # outside radius_km.
+    # Two-phase spatial query:
+    #   1. SQL narrows to a bounding box around the origin (cheap,
+    #      uses ix_location_lat_lng) plus every global service —
+    #      a row with either coordinate NULL applies everywhere
+    #      and must never be dropped by the bbox.
+    #   2. Python refines the box to a true circle via haversine.
+    #      The box is a strict superset of the circle, so no
+    #      qualifying row can be missed.
+    #
+    # Without the bbox predicate this scans every active service
+    # joined to every location. Fine at 10 orgs, not at the bc211
+    # sync scale (thousands of services). The bbox cuts the scan
+    # to the handful that are actually near the customer.
     stmt = (
         select(Service, Location)
         .join(ServiceAtLocation, ServiceAtLocation.service_id == Service.id)
         .join(Location, Location.id == ServiceAtLocation.location_id)
-        .where(Service.status == "active")
+        .where(
+            Service.status == "active",
+            or_(
+                # Global — either coordinate missing means "applies
+                # everywhere" (crisis lines, province-wide programs).
+                Location.latitude.is_(None),
+                Location.longitude.is_(None),
+                # Local — prefilter to the bounding box. Anything in
+                # the box but outside the circle is dropped by the
+                # haversine refine below.
+                and_(
+                    Location.latitude.between(
+                        lat0 - deg_pad_lat, lat0 + deg_pad_lat,
+                    ),
+                    Location.longitude.between(
+                        lng0 - deg_pad_lng, lng0 + deg_pad_lng,
+                    ),
+                ),
+            ),
+        )
     )
     rows = (await db.execute(stmt)).all()
 
@@ -534,6 +771,7 @@ async def _nearby_services(
                 return result
     return result
 
+
 _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "SHELTER":     ("shelter", "housing", "homeless", "residence", "hostel"),
     "FOOD":        ("food", "meal", "pantry", "kitchen", "grocer", "nutrition"),
@@ -587,68 +825,60 @@ def _render_service_full(
     return "\n".join(lines)
 
 
-def _render_nearby(
-    items: list[tuple[int, Service | None, Location | None, float | None]],
+
+def _render_nearby_short(
+    entries: list[_NearbyEntry],
     postal_code: str,
     display_name: str | None,
-    revealed: set[int],
 ) -> str:
     loc = postal_code or "unknown"
     if display_name and display_name != loc:
         loc = f"{loc} — {display_name}"
     header = f"## Customer location\n{loc}"
-    if not items:
+    if not entries:
         return header + "\n\nNo services were found near this location."
 
-    # Split by distance presence. Globals (dist None, svc present) come
-    # first, because they apply everywhere. Orphans (svc None) land in
-    # the local bucket when their sentinel is 0.0, or in globals when
-    # their sentinel is None; either way they render as
-    # "(no longer available)" and are not treated as a real entry.
-    globals_items: list = []
-    locals_items: list = []
-    for it in items:
-        if it[3] is None:
-            globals_items.append(it)
-        else:
-            locals_items.append(it)
+    globals_entries = [e for e in entries if e.distance_km is None]
+    locals_entries = [e for e in entries if e.distance_km is not None]
 
     lines = [header]
 
-    if globals_items:
+    if globals_entries:
         lines.append("")
         lines.append("## Global services (apply everywhere)")
-        current_loc_id: UUID | None = None
-        for idx, svc, loc_obj, _d in globals_items:
-            if svc is None or loc_obj is None:
-                lines.append(f"[{idx:02d}] (no longer available)")
+        current_loc_id: str | None = None
+        for e in globals_entries:
+            if e.missing:
+                lines.append(f"[{e.index:02d}] (no longer available)")
                 continue
-            if loc_obj.id != current_loc_id:
+            if e.location_id != current_loc_id:
                 if current_loc_id is not None:
                     lines.append("")
-                lines.append(loc_obj.name or "(unnamed location)")
-                if loc_obj.address:
-                    lines.append(loc_obj.address)
-                current_loc_id = loc_obj.id
-            lines.append(f"[{idx:02d}] {svc.name}")
+                lines.append(e.location_name or "(unnamed location)")
+                if e.location_address:
+                    lines.append(e.location_address)
+                current_loc_id = e.location_id
+            lines.append(f"[{e.index:02d}] {e.name}")
 
-    if locals_items:
+    if locals_entries:
         lines.append("")
         lines.append("## Nearby services")
         current_loc_id = None
-        for idx, svc, loc_obj, dist in locals_items:
-            if svc is None or loc_obj is None:
-                lines.append(f"[{idx:02d}] (no longer available)")
+        for e in locals_entries:
+            if e.missing:
+                lines.append(f"[{e.index:02d}] (no longer available)")
                 continue
-            if loc_obj.id != current_loc_id:
+            if e.location_id != current_loc_id:
                 if current_loc_id is not None:
                     lines.append("")
-                name = loc_obj.name or "(unnamed location)"
-                lines.append(f"{name} ({dist:.1f}km away)")
-                if loc_obj.address:
-                    lines.append(loc_obj.address)
-                current_loc_id = loc_obj.id
-            lines.append(f"[{idx:02d}] {svc.name}")
+                lines.append(
+                    f"{e.location_name or '(unnamed location)'} "
+                    f"({e.distance_km:.1f}km away)"
+                )
+                if e.location_address:
+                    lines.append(e.location_address)
+                current_loc_id = e.location_id
+            lines.append(f"[{e.index:02d}] {e.name}")
 
     lines.append(
         "\nCall `get_service_details(n)` to expand any service. "
@@ -656,19 +886,18 @@ def _render_nearby(
         "the tool returns description, eligibility, application process, "
         "fees, and contact."
     )
-
-    if revealed:
-        lines.append("\n## Additional details requested by the customer")
-        for i in sorted(revealed):
-            if i < 0 or i >= len(items):
-                continue
-            idx, svc, loc_obj, d = items[i]
-            if svc is None:
-                lines.append(f"\n### [{idx:02d}] (no longer available)")
-            else:
-                lines.append(_render_service_full(idx, svc, loc_obj, d))
-
     return "\n".join(lines)
+
+
+def _render_revealed_section(
+    revealed: dict[int, _RevealedDetail],
+) -> str:
+    if not revealed:
+        return ""
+    parts = ["## Additional details requested by the customer"]
+    for idx in sorted(revealed):
+        parts.append(revealed[idx].rendered)  # each starts with "\n###"
+    return "\n".join(parts)
 
 
 def _parse_index(raw) -> int | None:
@@ -691,14 +920,6 @@ def _parse_index(raw) -> int | None:
     except ValueError:
         return None
 
-
-async def _lookup_location_and_distance(
-    db: AsyncSession, svc: Service, sess: InterviewSession,
-) -> tuple[Location | None, float | None]:
-    origin_lat = float(sess.origin_lat) if sess.origin_lat is not None else 0.0
-    origin_lng = float(sess.origin_lng) if sess.origin_lng is not None else 0.0
-    hits = await _closest_location_per_service(db, [svc.id], origin_lat, origin_lng)
-    return hits.get(svc.id, (None, None))
 
 
 async def _fetch_nearby_by_ids(
@@ -769,35 +990,46 @@ async def _execute_get_service_details(
     if idx is None:
         return "error: index must be an integer like 17 or [17]", None
 
-    ids = sess.nearby_service_ids or []
-    if not ids:
-        return "error: no nearby services available for this session", None
-    if idx < 0 or idx >= len(ids):
+    cache = await _ensure_nearby_cache(sess, db)
+
+    if idx < 0 or idx >= len(cache.entries):
         return (
-            f"error: index {idx} out of range; the list has {len(ids)} entries",
+            f"error: index {idx} out of range; the list has "
+            f"{len(cache.entries)} entries",
             None,
         )
-    try:
-        svc_uuid = UUID(ids[idx])
-    except ValueError:
-        return f"error: malformed id at index {idx}", None
 
-    svc = await db.get(Service, svc_uuid)
+    # Already revealed this session — return the cached render.
+    existing = cache.revealed.get(idx)
+    if existing is not None:
+        return existing.rendered, existing.card
+
+    entry = cache.entries[idx]
+    if entry.missing or not entry.service_id:
+        return f"error: service at index {idx} no longer exists", None
+
+    svc = await db.get(Service, UUID(entry.service_id))
     if svc is None:
         return f"error: service at index {idx} no longer exists", None
 
-    loc, dist = await _lookup_location_and_distance(db, svc, sess)
-    text = _render_service_full(idx, svc, loc, dist)
-    card = _card_payload(idx, svc, loc, dist)
+    loc = (
+        await db.get(Location, UUID(entry.location_id))
+        if entry.location_id else None
+    )
 
+    rendered = _render_service_full(idx, svc, loc, entry.distance_km)
+    card = _card_payload(idx, svc, loc, entry.distance_km)
+
+    cache.revealed[idx] = _RevealedDetail(rendered=rendered, card=card)
+
+    # Persist the reveal so finalize and restart-rebuild see it.
     revealed = set(sess.revealed_service_indices or [])
     if idx not in revealed:
         revealed.add(idx)
         sess.revealed_service_indices = sorted(revealed)
         await db.commit()
 
-    return text, card
-
+    return rendered, card
 
 
 def _language_directive(locale: str | None, locale_name: str | None) -> str:
@@ -858,7 +1090,7 @@ def _render_session_context(sess: InterviewSession) -> str:
 
 
 async def _build_chat_context(
-    sid: UUID, db: AsyncSession, base: str | None = None
+    sid: UUID, db: AsyncSession, base: str | None = None,
 ):
     if base is None:
         base = get_runtime().current().chat_prompt
@@ -905,28 +1137,15 @@ async def _build_chat_context(
     system_prompt = assemble_prompt(enriched_base, rendered)
 
     if sess and sess.origin_lat is not None and sess.origin_lng is not None:
-        items = await _fetch_nearby_by_ids(db, sess.nearby_service_ids or [], sess)
-        if not items:
-            n = get_runtime().current().nearby
-            rows = await _nearby_services(
-                db, sess.origin_lat, sess.origin_lng,
-                n.radius_km, n.location_limit, n.index_limit,
-            )
-            sess.nearby_service_ids = [str(svc.id) for svc, _l, _d in rows]
-            await db.commit()
-            items = [
-                (i, svc, loc, d) for i, (svc, loc, d) in enumerate(rows)
-            ]
-        block = _render_nearby(
-            items,
-            sess.postal_code or "unknown",
-            sess.origin_display_name,
-            set(sess.revealed_service_indices or []),
-        )
+        cache = await _ensure_nearby_cache(sess, db)
+        block = cache.short_block
+        if cache.revealed:
+            block += "\n\n" + _render_revealed_section(cache.revealed)
         system_prompt += "\n\n" + block
         used += estimate_tokens(block, model_name=cfg.tokenizer_model)
 
     return system_prompt, included, skipped, used
+
 
 
 @router.post("/{sid}/context-prompt", response_model=ContextPromptOut)

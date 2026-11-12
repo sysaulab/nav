@@ -1,8 +1,12 @@
 """Public UI-string endpoint for nav-ui.
 
 Not auth-gated: nav-ui runs on a kiosk with no bearer token and needs
-translations at boot. Only returns translations for the requested
-locale; the client already ships the English source as a fallback.
+translations at boot. English is served from ui_string_translation the
+same way as every other locale — the client carries no bundled English
+dictionary. English rows are populated from ui_string.english by
+seed_missing_english (translator signature "source"), and can be
+overridden by an operator via /admin-api (signature "manual"). The
+client sees whichever the server serves.
 """
 from __future__ import annotations
 
@@ -21,10 +25,6 @@ async def get_strings(
     locale: str = Query(..., min_length=2, max_length=10),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    if locale == "en":
-        # English is the source — nothing to return. The client already
-        # has it bundled.
-        return {"locale": "en", "strings": {}}
     rows = (await db.execute(
         select(UiStringTranslation.key, UiStringTranslation.translated)
         .where(UiStringTranslation.locale == locale)

@@ -22,7 +22,7 @@ from .models import (
 )
 from .ai.registry import reload_registry
 from .runtime import reload_runtime
-from .translator import run_translation_job
+from .translator import run_translation_job, seed_missing_english
 from .ui_strings import CONTEXTS, ENGLISH_STRINGS
 from .routers import (
     admin,
@@ -77,25 +77,39 @@ async def _purge_loop(interval: float) -> None:
 async def _sync_ui_strings(db) -> None:
     """Reconcile the database with the English dictionary.
 
-    The dictionary in ui_strings.py is the source of truth. Two things
-    happen on startup:
+    The dictionary in ui_strings.py is the source of truth. Three
+    things happen on startup:
 
-      1. Keys present in the dictionary but absent from the DB are
+      1. Keys present in the dictionary but absent from ui_string are
          inserted. This is how a new string gets its first English row.
 
-      2. Keys whose English text has changed are updated, and every
-         existing translation for that key is deleted. A translation
-         of stale English is worse than a missing translation: the
-         missing one shows an empty cell (honest); the stale one shows
-         text that no longer matches the UI (silently wrong).
+      2. Keys whose English text has changed are updated. If the en
+         row is source-managed (or missing), the new text is propagated
+         and every existing non-English translation for that key is
+         deleted — a translation of stale English is worse than a
+         missing one. If the en row is operator-overridden
+         (signature='manual'), the file text is recorded but the
+         override and its translations are left alone: the non-English
+         rows were translating the override, not the file.
 
-    Idempotent. Running on every boot is cheap (one SELECT, a few
-    UPDATEs only when the dictionary actually changed).
+      3. en rows are backfilled for any key that lacks one. This is
+         what makes English a served-from-DB locale on a fresh install
+         and on any database predating en-in-db.
+
+    Idempotent. Running on every boot is cheap.
     """
     current = {
         row.key: row
         for row in (await db.execute(select(UiString))).scalars()
     }
+    en_by_key = {
+        r.key: r for r in (await db.execute(
+            select(UiStringTranslation).where(
+                UiStringTranslation.locale == "en"
+            )
+        )).scalars()
+    }
+
     added = updated = 0
     for key, english in ENGLISH_STRINGS.items():
         if key not in current:
@@ -104,19 +118,46 @@ async def _sync_ui_strings(db) -> None:
             ))
             added += 1
         elif current[key].english != english:
-            await db.execute(
-                sa_delete(UiStringTranslation).where(
-                    UiStringTranslation.key == key,
-                )
-            )
             current[key].english = english
             current[key].context = CONTEXTS.get(key)
+
+            en_row = en_by_key.get(key)
+            if en_row is None or en_row.translator_signature == "source":
+                # Source-managed English: propagate the file change and
+                # invalidate every non-English translation — they were
+                # translating the *previous* effective English, which
+                # just changed. If the en row is missing entirely,
+                # create it now with the new text.
+                if en_row is None:
+                    db.add(UiStringTranslation(
+                        key=key, locale="en", translated=english,
+                        translator_signature="source",
+                    ))
+                else:
+                    en_row.translated = english
+                    en_row.translated_at = datetime.now(timezone.utc)
+                await db.execute(
+                    sa_delete(UiStringTranslation).where(
+                        UiStringTranslation.key == key,
+                        UiStringTranslation.locale != "en",
+                    )
+                )
+            # else: translator_signature == "manual" — operator override
+            # is the effective English. Non-English rows were derived
+            # from *that*, not from the file. Leave everything alone.
             updated += 1
+
     await db.commit()
-    if added or updated:
+
+    # Backfill: covers fresh installs and legacy databases predating
+    # en-in-db. Idempotent; does not touch manual overrides.
+    seeded = await seed_missing_english(db)
+
+    if added or updated or seeded:
         log.info(
-            "ui_strings.synced added=%d updated=%d (translations invalidated)",
-            added, updated,
+            "ui_strings.synced added=%d updated=%d en_seeded=%d "
+            "(translations invalidated where applicable)",
+            added, updated, seeded,
         )
 
 
