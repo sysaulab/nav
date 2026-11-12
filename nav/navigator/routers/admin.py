@@ -1206,12 +1206,34 @@ async def start_translation_job(
 ) -> JobOut:
     from ..translator import run_translation_job
 
+    # Serialize concurrent job creation. Two admins clicking "Translate
+    # missing" at the same instant both pass the row-count check and both
+    # insert a job; both then run against the same string table, doubling
+    # the LLM calls, the DB churn on ui_string_translation, and the number
+    # of "Cancel" targets the UI has to reconcile.
+    #
+    # An advisory lock is the migration-free fix. A partial unique index
+    # on (status) WHERE status IN ('pending','running') would be the
+    # database-level guarantee, but create_all() never ALTERs existing
+    # tables — every deployed database would need a manual migration.
+    # The transaction-scoped advisory lock below is released on commit
+    # or rollback and requires nothing beyond this handler.
+    #
+    # Key 920113 is distinct from schema creation (920110), session purge
+    # (920111), and directory import (920112).
+    await db.execute(text("SELECT pg_advisory_xact_lock(920113)"))
+
     active = (await db.execute(
         select(func.count()).select_from(TranslationJob).where(
             TranslationJob.status.in_(["pending", "running"])
         )
     )).scalar() or 0
     if active:
+        # Raising inside a transaction holding a `_xact_` lock is safe:
+        # SQLAlchemy rolls back when the session context manager exits,
+        # which releases the lock. The next waiter proceeds and sees the
+        # same conflicting row (or, if the winner has since finished, an
+        # empty count).
         raise HTTPException(409, "a translation job is already running")
 
     if payload.mode == "refresh":
@@ -1226,6 +1248,9 @@ async def start_translation_job(
 
     job = TranslationJob(mode=payload.mode, locale=payload.locale)
     db.add(job)
+    # Commit here releases the advisory lock. A concurrent request that
+    # was blocked on pg_advisory_xact_lock now re-reads the count, sees
+    # the freshly-committed pending job, and 409s as intended.
     await db.commit()
     await db.refresh(job)
 

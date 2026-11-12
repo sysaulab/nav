@@ -1086,7 +1086,21 @@ def _render_session_context(sess: InterviewSession) -> str:
 
 async def _build_chat_context(
     sid: UUID, db: AsyncSession, base: str | None = None,
-):
+) -> tuple[str, list[SessionDocument], list[dict]]:
+    """Assemble the system prompt for one interview turn.
+
+    Returns (system_prompt, included_docs, skipped_docs). The prompt
+    includes the base text, the session context header, every included
+    document rendered as a compact fragment, and — when the session has
+    a location — the nearby-services block plus any reveals.
+
+    The doc-budget check uses an internal `used` accumulator (tokens of
+    docs included so far, against `document_budget_tokens`). It is
+    deliberately not returned: `used` is a partial count, not the full
+    prompt cost against `context_window`. Callers that need the full
+    prompt size re-estimate `system_prompt` via `estimate_tokens` — see
+    `get_context_prompt`, which does exactly that.
+    """
     if base is None:
         base = get_runtime().current().chat_prompt
     cfg = _cfg()
@@ -1137,9 +1151,8 @@ async def _build_chat_context(
         if cache.revealed:
             block += "\n\n" + _render_revealed_section(cache.revealed)
         system_prompt += "\n\n" + block
-        used += estimate_tokens(block, model_name=cfg.tokenizer_model)
 
-    return system_prompt, included, skipped, used
+    return system_prompt, included, skipped
 
 
 
@@ -1153,14 +1166,14 @@ async def get_context_prompt(
     await _require_active(sid, request, db)
     cfg = _cfg()
     spec = get_registry().default_chat()
-    
-    system_prompt, included, skipped, _ = await _build_chat_context(sid, db)
-    
+
+    system_prompt, included, skipped = await _build_chat_context(sid, db)
+
     prompt_tokens = estimate_tokens(system_prompt, model_name=cfg.tokenizer_model)
-    
+
     msgs = [{"role": m.role, "content": m.content} for m in payload.messages if m.role in ("user", "assistant")]
     chat_tokens = estimate_chat_tokens(msgs, model_name=cfg.tokenizer_model)
-    
+
     return ContextPromptOut(
         system_prompt=system_prompt,
         included=[DocumentMetaOut.model_validate(d) for d in included],
@@ -1336,7 +1349,7 @@ async def chat(
     await _require_located(sess)
     spec = get_registry().default_chat()
 
-    system_prompt, _included, _skipped, _used = await _build_chat_context(sid, db)
+    system_prompt, _included, _skipped = await _build_chat_context(sid, db)
     system_prompt += _language_directive(payload.locale, payload.locale_name)
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
@@ -1364,7 +1377,7 @@ async def finalize(
     await _require_located(sess)
     spec = get_registry().default_finalize()
 
-    system_prompt, _included, _skipped, _used = await _build_chat_context(
+    system_prompt, _included, _skipped = await _build_chat_context(
         sid, db, base=get_runtime().current().finalize_prompt
     )
     system_prompt += _language_directive(payload.locale, payload.locale_name)
