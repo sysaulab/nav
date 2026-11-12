@@ -87,10 +87,12 @@ class _SessionNearbyCache:
     entries: list[_NearbyEntry]
     short_block: str
     revealed: dict[int, _RevealedDetail]
+    built_at: float = 0.0
 
 
 _session_nearby_cache: dict[UUID, _SessionNearbyCache] = {}
 _SESSION_NEARBY_CACHE_MAX = 500
+_SESSION_NEARBY_CACHE_TTL_S = 120.0
 
 
 def _location_hash(sess: InterviewSession) -> str:
@@ -134,6 +136,7 @@ def _build_cache_from_items(
         entries=entries,
         short_block=short_block,
         revealed={},
+        built_at=_time.monotonic(),
     )
 
 
@@ -184,7 +187,18 @@ async def _ensure_nearby_cache(
     current_hash = _location_hash(sess)
     cache = _session_nearby_cache.get(sess.id)
     if cache is not None and cache.location_hash == current_hash:
-        return cache
+        # Fresh-enough cache hit. The TTL bounds staleness for the
+        # "admin edited a service mid-session" case — without it, a
+        # service rendered into `revealed[idx]` stays frozen at its
+        # reveal-time text for the entire session, potentially hours.
+        # 120 s keeps the rebuild cost negligible (a rebuild re-fetches
+        # each revealed service individually) while ensuring a just-
+        # edited description reaches the customer within two minutes.
+        # Reveals survive the rebuild — _rebuild_nearby_cache re-reads
+        # sess.revealed_service_indices from the DB and re-fetches each
+        # service by id, so the rebuild always reflects current data.
+        if _time.monotonic() - cache.built_at < _SESSION_NEARBY_CACHE_TTL_S:
+            return cache
 
     if len(_session_nearby_cache) >= _SESSION_NEARBY_CACHE_MAX:
         for k in list(_session_nearby_cache.keys())[:50]:
@@ -215,33 +229,9 @@ async def _ensure_nearby_cache(
 # on the next turn. A DB-backed cache would add a schema change
 # for zero practical benefit here.
 
-_render_cache: dict[UUID, tuple[str, int, str, float]] = {}
-_RENDER_CACHE_TTL_S = 120.0
-_RENDER_CACHE_MAX = 200
 
 
-def _location_hash(sess: InterviewSession) -> str:
-    return (
-        f"{sess.postal_code or ''}|"
-        f"{sess.origin_lat}|{sess.origin_lng}|"
-        f"{sess.origin_display_name or ''}"
-    )
 
-
-def _invalidate_render_cache(sid: UUID) -> None:
-    _render_cache.pop(sid, None)
-
-
-def _prune_render_cache() -> None:
-    if not _render_cache:
-        return
-    now = _time.monotonic()
-    for k in [k for k, v in _render_cache.items() if now - v[3] > _RENDER_CACHE_TTL_S]:
-        _render_cache.pop(k, None)
-    if len(_render_cache) > _RENDER_CACHE_MAX:
-        excess = len(_render_cache) - _RENDER_CACHE_MAX
-        for k, _ in sorted(_render_cache.items(), key=lambda kv: kv[1][3])[:excess]:
-            _render_cache.pop(k, None)
 
 
 
